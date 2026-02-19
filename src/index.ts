@@ -37,6 +37,11 @@ export default {
       return Response.json(apps);
     }
 
+    // Debug FreeClimb account
+    if (url.pathname === '/debug/account' && request.method === 'GET') {
+      return debugAccount(env);
+    }
+
     // List FreeClimb phone numbers
     if (url.pathname === '/phone-numbers' && request.method === 'GET') {
       return listPhoneNumbers(env);
@@ -45,6 +50,11 @@ export default {
     // Setup FreeClimb application and phone number
     if (url.pathname === '/setup' && request.method === 'POST') {
       return handleSetup(request, env);
+    }
+
+    // Update phone number alias
+    if (url.pathname === '/update-number' && request.method === 'POST') {
+      return updatePhoneNumber(request, env);
     }
 
     return new Response('Not Found', { status: 404 });
@@ -188,11 +198,55 @@ function buildPerCL(response: any, baseUrl: string): any[] {
   return percl;
 }
 
+async function debugAccount(env: Env): Promise<Response> {
+  const accountId = env.FREECLIMB_ACCOUNT_ID;
+  const apiKey = env.FREECLIMB_API_KEY;
+  const auth = btoa(`${accountId}:${apiKey}`);
+  const apiBase = 'https://www.freeclimb.com/apiserver';
+
+  try {
+    // Try different API paths
+    const tests = [
+      { name: 'Account', url: `${apiBase}/Accounts/${accountId}` },
+      { name: 'IncomingPhoneNumbers (with account)', url: `${apiBase}/Accounts/${accountId}/IncomingPhoneNumbers` },
+      { name: 'Applications (with account)', url: `${apiBase}/Accounts/${accountId}/Applications` },
+      { name: 'IncomingPhoneNumbers (no account)', url: `${apiBase}/IncomingPhoneNumbers` },
+      { name: 'Applications (no account)', url: `${apiBase}/Applications` },
+      { name: 'Calls', url: `${apiBase}/Calls` },
+    ];
+
+    const results = [];
+
+    for (const test of tests) {
+      const response = await fetch(test.url, {
+        headers: {
+          'Authorization': `Basic ${auth}`,
+        },
+      });
+
+      const data = await response.text();
+      results.push({
+        endpoint: test.name,
+        status: response.status,
+        response: data.substring(0, 200), // First 200 chars
+      });
+    }
+
+    return Response.json({
+      accountId: accountId.substring(0, 8) + '...',
+      results,
+    });
+
+  } catch (error) {
+    return Response.json({ error: String(error) }, { status: 500 });
+  }
+}
+
 async function listPhoneNumbers(env: Env): Promise<Response> {
   const accountId = env.FREECLIMB_ACCOUNT_ID;
   const apiKey = env.FREECLIMB_API_KEY;
   const auth = btoa(`${accountId}:${apiKey}`);
-  const apiBase = 'https://api.freeclimb.com/apiserver';
+  const apiBase = 'https://www.freeclimb.com/apiserver';
 
   try {
     const response = await fetch(`${apiBase}/Accounts/${accountId}/IncomingPhoneNumbers`, {
@@ -242,7 +296,7 @@ async function handleSetup(request: Request, env: Env): Promise<Response> {
   const accountId = env.FREECLIMB_ACCOUNT_ID;
   const apiKey = env.FREECLIMB_API_KEY;
   const auth = btoa(`${accountId}:${apiKey}`);
-  const apiBase = 'https://api.freeclimb.com/apiserver';
+  const apiBase = 'https://www.freeclimb.com/apiserver';
 
   try {
     // Step 1: Create FreeClimb Application
@@ -349,5 +403,46 @@ async function handleSetup(request: Request, env: Env): Promise<Response> {
   } catch (error) {
     console.error('Setup error:', error);
     return Response.json({ error: 'Setup failed', details: String(error) }, { status: 500 });
+  }
+}
+
+async function updatePhoneNumber(request: Request, env: Env): Promise<Response> {
+  const body = await request.json() as { phoneNumberId: string; alias?: string };
+
+  const accountId = env.FREECLIMB_ACCOUNT_ID;
+  const apiKey = env.FREECLIMB_API_KEY;
+  const auth = btoa(`${accountId}:${apiKey}`);
+  const apiBase = 'https://www.freeclimb.com/apiserver';
+
+  try {
+    const updateResponse = await fetch(
+      `${apiBase}/Accounts/${accountId}/IncomingPhoneNumbers/${body.phoneNumberId}`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Basic ${auth}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          alias: body.alias,
+        }),
+      }
+    );
+
+    if (!updateResponse.ok) {
+      const error = await updateResponse.text();
+      return Response.json({ error: 'Failed to update phone number', details: error }, { status: 500 });
+    }
+
+    const updated = await updateResponse.json();
+
+    return Response.json({
+      success: true,
+      phoneNumber: updated,
+    });
+
+  } catch (error) {
+    console.error('Update error:', error);
+    return Response.json({ error: 'Update failed', details: String(error) }, { status: 500 });
   }
 }
