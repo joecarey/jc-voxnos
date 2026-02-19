@@ -126,17 +126,15 @@ async function handleTranscription(request: Request, env: Env): Promise<Response
     callId: string;
     from: string;
     to: string;
-    recordingId: string;
-    recordingUrl: string;
-    digits?: string;
-    reason: string;
-    recognitionResult?: {
-      transcript: string;
-      confidence: number;
-    };
+    recordingId?: string;
+    recordingUrl?: string;
+    transcript?: string;
+    transcribeReason?: string;
+    transcriptionDurationMs?: number;
   };
 
-  console.log(`Transcription for call ${body.callId}:`, body.recognitionResult?.transcript);
+  console.log(`Transcription webhook received:`, JSON.stringify(body));
+  console.log(`Transcription for call ${body.callId}:`, body.transcript);
 
   // Route to app
   const app = registry.getForNumber(body.to);
@@ -155,9 +153,29 @@ async function handleTranscription(request: Request, env: Env): Promise<Response
 
   // Build speech input from transcription
   const input: SpeechInput = {
-    text: body.recognitionResult?.transcript ?? '',
-    confidence: body.recognitionResult?.confidence,
+    text: body.transcript ?? '',
+    confidence: undefined,  // FreeClimb doesn't provide confidence in TranscribeUtterance
   };
+
+  // If no transcription, ask to repeat
+  if (!input.text || input.text.trim() === '') {
+    console.log('No transcription received, asking user to repeat');
+    return Response.json([
+      { Say: { text: "I didn't catch that. Could you please repeat?" } },
+      {
+        TranscribeUtterance: {
+          actionUrl: `${new URL(request.url).origin}/transcription`,
+          playBeep: false,
+          record: {
+            maxLengthSec: 25,
+            rcrdTerminationSilenceTimeMs: 4000,
+          },
+        },
+      },
+    ], {
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
 
   // Call app's onSpeech handler
   const response = await app.onSpeech(context, input);
@@ -174,13 +192,19 @@ async function handleTranscription(request: Request, env: Env): Promise<Response
 function buildPerCL(response: any, baseUrl: string): any[] {
   const percl: any[] = [];
 
-  // Say the response text
+  // Say the response text with ElevenLabs
   if (response.speech?.text) {
     percl.push({
       Say: {
         text: response.speech.text,
-        voice: response.speech.voice,
-        language: response.speech.language,
+        engine: {
+          name: 'ElevenLabs',
+          parameters: {
+            voice_id: 'EXAVITQu4vr4xnSDxMaL',  // Sarah - friendly female voice
+            language_code: 'en',
+            apply_text_normalization: 'on',
+          },
+        },
       },
     });
   }
