@@ -1,10 +1,22 @@
-// Claude-powered voice assistant app
+// Claude-powered voice assistant app with tool support
 
 import type { VoxnosApp, AppContext, SpeechInput, AppResponse } from '../core/types.js';
+import { toolRegistry } from '../tools/registry.js';
+import type { ToolUseRequest } from '../tools/types.js';
+
+interface ContentBlock {
+  type: 'text' | 'tool_use' | 'tool_result';
+  text?: string;
+  id?: string;
+  name?: string;
+  input?: Record<string, any>;
+  tool_use_id?: string;
+  content?: string;
+}
 
 interface Message {
   role: 'user' | 'assistant';
-  content: string;
+  content: string | ContentBlock[];
 }
 
 // Simple in-memory conversation storage (callId -> messages)
@@ -49,14 +61,8 @@ export class ClaudeAssistant implements VoxnosApp {
       content: userMessage,
     });
 
-    // Call Claude API
+    // Call Claude API (with tool support)
     const assistantResponse = await this.callClaude(context, history);
-
-    // Add assistant response to history
-    history.push({
-      role: 'assistant',
-      content: assistantResponse,
-    });
 
     // Update conversation
     conversations.set(context.callId, history);
@@ -81,34 +87,87 @@ export class ClaudeAssistant implements VoxnosApp {
 - Use natural, conversational language
 - Avoid special characters, URLs, or formatting
 - If asked complex questions, summarize briefly and offer to elaborate
-- Be friendly and helpful`;
+- Be friendly and helpful
+- When using tools, explain what you found in a natural way`;
 
     try {
-      const response = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': context.env.ANTHROPIC_API_KEY,
-          'anthropic-version': '2023-06-01',
-        },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-5-20250929',
-          max_tokens: 200,  // Keep responses short for voice
-          system: systemPrompt,
-          messages: history,
-        }),
-      });
+      let continueLoop = true;
+      let finalText = '';
 
-      if (!response.ok) {
-        console.error('Claude API error:', response.status);
-        return 'I\'m sorry, I\'m having trouble processing that right now. Could you try again?';
+      // Tool use may require multiple API calls
+      while (continueLoop) {
+        const response = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': context.env.ANTHROPIC_API_KEY,
+            'anthropic-version': '2023-06-01',
+          },
+          body: JSON.stringify({
+            model: 'claude-sonnet-4-5-20250929',
+            max_tokens: 300,  // Slightly higher for tool use
+            system: systemPrompt,
+            messages: history,
+            tools: toolRegistry.getDefinitions(),
+          }),
+        });
+
+        if (!response.ok) {
+          console.error('Claude API error:', response.status);
+          return 'I\'m sorry, I\'m having trouble processing that right now. Could you try again?';
+        }
+
+        const data = await response.json() as {
+          content: ContentBlock[];
+          stop_reason: string;
+        };
+
+        console.log('Claude response:', JSON.stringify(data));
+
+        // Process response content
+        const assistantContent: ContentBlock[] = [];
+        const toolResults: ContentBlock[] = [];
+
+        for (const block of data.content) {
+          if (block.type === 'text') {
+            finalText = block.text || '';
+            assistantContent.push(block);
+          } else if (block.type === 'tool_use') {
+            assistantContent.push(block);
+
+            // Execute the tool
+            console.log(`Executing tool: ${block.name} with input:`, block.input);
+            const toolResult = await toolRegistry.execute(block.name!, block.input!);
+            console.log(`Tool result:`, toolResult);
+
+            // Prepare tool result for next turn
+            toolResults.push({
+              type: 'tool_result',
+              tool_use_id: block.id!,
+              content: toolResult,
+            });
+          }
+        }
+
+        // Add assistant response to history
+        history.push({
+          role: 'assistant',
+          content: assistantContent,
+        });
+
+        // If tools were used, add results and continue loop
+        if (toolResults.length > 0) {
+          history.push({
+            role: 'user',
+            content: toolResults,
+          });
+          continueLoop = true;  // Make another API call with tool results
+        } else {
+          continueLoop = false;  // Done
+        }
       }
 
-      const data = await response.json() as {
-        content: { type: string; text: string }[];
-      };
-
-      return data.content[0]?.text || 'I didn\'t catch that. Could you repeat?';
+      return finalText || 'I didn\'t catch that. Could you repeat?';
 
     } catch (error) {
       console.error('Error calling Claude API:', error);

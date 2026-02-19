@@ -4,6 +4,11 @@ import { registry } from './core/registry.js';
 import { EchoApp } from './apps/echo.js';
 import { ClaudeAssistant } from './apps/claude-assistant.js';
 import type { Env, AppContext, SpeechInput } from './core/types.js';
+import { toolRegistry } from './tools/registry.js';
+import { WeatherTool } from './tools/weather.js';
+
+// Register tools
+toolRegistry.register(new WeatherTool());
 
 // Register apps
 registry.register(new EchoApp());                // Simple echo demo
