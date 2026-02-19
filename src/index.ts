@@ -202,8 +202,14 @@ function buildPerCL(response: any, baseUrl: string): any[] {
     percl.push({
       Say: {
         text: response.speech.text,
-        // TODO: Enable ElevenLabs once account is authorized
-        // Contact FreeClimb support to enable ElevenLabs TTS
+        engine: {
+          name: 'ElevenLabs',
+          parameters: {
+            voice_id: 'EXAVITQu4vr4xnSDxMaL',  // Sarah voice
+            language_code: 'en',
+            apply_text_normalization: 'on',
+          },
+        },
       },
     });
   }
