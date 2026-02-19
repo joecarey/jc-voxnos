@@ -37,6 +37,11 @@ export default {
       return Response.json(apps);
     }
 
+    // Setup FreeClimb application and phone number
+    if (url.pathname === '/setup' && request.method === 'POST') {
+      return handleSetup(request, env);
+    }
+
     return new Response('Not Found', { status: 404 });
   },
 };
@@ -176,4 +181,121 @@ function buildPerCL(response: any, baseUrl: string): any[] {
   }
 
   return percl;
+}
+
+async function handleSetup(request: Request, env: Env): Promise<Response> {
+  const body = await request.json() as { phoneNumber?: string };
+  const baseUrl = new URL(request.url).origin;
+
+  const accountId = env.FREECLIMB_ACCOUNT_ID;
+  const apiKey = env.FREECLIMB_API_KEY;
+  const auth = btoa(`${accountId}:${apiKey}`);
+  const apiBase = 'https://api.freeclimb.com/apiserver';
+
+  try {
+    // Step 1: Create FreeClimb Application
+    console.log('Creating FreeClimb application...');
+    const appResponse = await fetch(`${apiBase}/Accounts/${accountId}/Applications`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${auth}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        alias: 'Voxnos Platform',
+        voiceUrl: `${baseUrl}/voice`,
+        voiceFallbackUrl: `${baseUrl}/voice`,
+      }),
+    });
+
+    if (!appResponse.ok) {
+      const error = await appResponse.text();
+      return Response.json({ error: 'Failed to create application', details: error }, { status: 500 });
+    }
+
+    const application = await appResponse.json() as { applicationId: string };
+    console.log('Application created:', application.applicationId);
+
+    // Step 2: Get phone numbers
+    console.log('Fetching phone numbers...');
+    const numbersResponse = await fetch(`${apiBase}/Accounts/${accountId}/IncomingPhoneNumbers`, {
+      headers: {
+        'Authorization': `Basic ${auth}`,
+      },
+    });
+
+    if (!numbersResponse.ok) {
+      const error = await numbersResponse.text();
+      return Response.json({ error: 'Failed to fetch phone numbers', details: error }, { status: 500 });
+    }
+
+    const numbersData = await numbersResponse.json() as {
+      incomingPhoneNumbers: Array<{
+        phoneNumberId: string;
+        phoneNumber: string;
+        alias: string;
+      }>;
+    };
+
+    const phoneNumbers = numbersData.incomingPhoneNumbers || [];
+
+    if (phoneNumbers.length === 0) {
+      return Response.json({
+        error: 'No phone numbers found',
+        application: { id: application.applicationId, voiceUrl: `${baseUrl}/voice` },
+      });
+    }
+
+    // Step 3: Update phone number to use the application
+    const targetNumber = body.phoneNumber
+      ? phoneNumbers.find(n => n.phoneNumber === body.phoneNumber)
+      : phoneNumbers[0]; // Use first number if none specified
+
+    if (!targetNumber) {
+      return Response.json({
+        error: 'Phone number not found',
+        available: phoneNumbers.map(n => n.phoneNumber),
+        application: { id: application.applicationId, voiceUrl: `${baseUrl}/voice` },
+      });
+    }
+
+    console.log(`Configuring phone number ${targetNumber.phoneNumber}...`);
+    const updateResponse = await fetch(
+      `${apiBase}/Accounts/${accountId}/IncomingPhoneNumbers/${targetNumber.phoneNumberId}`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Basic ${auth}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          applicationId: application.applicationId,
+        }),
+      }
+    );
+
+    if (!updateResponse.ok) {
+      const error = await updateResponse.text();
+      return Response.json({ error: 'Failed to update phone number', details: error }, { status: 500 });
+    }
+
+    return Response.json({
+      success: true,
+      application: {
+        id: application.applicationId,
+        name: 'Voxnos Platform',
+        voiceUrl: `${baseUrl}/voice`,
+      },
+      phoneNumber: {
+        id: targetNumber.phoneNumberId,
+        number: targetNumber.phoneNumber,
+        configured: true,
+      },
+      message: `Call ${targetNumber.phoneNumber} to test the Claude assistant!`,
+    });
+
+  } catch (error) {
+    console.error('Setup error:', error);
+    return Response.json({ error: 'Setup failed', details: String(error) }, { status: 500 });
+  }
 }
