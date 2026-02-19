@@ -2,10 +2,12 @@
 
 import { registry } from './core/registry.js';
 import { EchoApp } from './apps/echo.js';
+import { ClaudeAssistant } from './apps/claude-assistant.js';
 import type { Env, AppContext, SpeechInput } from './core/types.js';
 
 // Register apps
-registry.register(new EchoApp(), true);  // Default app
+registry.register(new EchoApp());                // Simple echo demo
+registry.register(new ClaudeAssistant(), true);  // Default: Claude-powered assistant
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
