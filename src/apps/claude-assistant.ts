@@ -21,7 +21,7 @@ export class ClaudeAssistant implements VoxnosApp {
 
     return {
       speech: {
-        text: 'Hello! I\'m Claude, your voice assistant. How can I help you today?',
+        text: this.getTimeBasedGreeting(),
       },
       prompt: true,
     };
@@ -114,6 +114,24 @@ export class ClaudeAssistant implements VoxnosApp {
       console.error('Error calling Claude API:', error);
       return 'I\'m experiencing technical difficulties. Please try again.';
     }
+  }
+
+  private getTimeBasedGreeting(): string {
+    // Get current time in Central Time (America/Chicago)
+    const now = new Date();
+    const centralTime = new Date(now.toLocaleString('en-US', { timeZone: 'America/Chicago' }));
+    const hour = centralTime.getHours();
+
+    let greeting: string;
+    if (hour >= 5 && hour < 12) {
+      greeting = 'Good morning';
+    } else if (hour >= 12 && hour < 18) {
+      greeting = 'Good afternoon';
+    } else {
+      greeting = 'Good evening';
+    }
+
+    return `${greeting}! How can I help you today?`;
   }
 
   private isGoodbye(text: string): boolean {
