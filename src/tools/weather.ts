@@ -23,15 +23,10 @@ export class WeatherTool implements Tool {
 
     try {
       // Step 1: Geocode the location to get coordinates
-      const geoResponse = await fetch(
-        `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(location)}&count=1&language=en&format=json`
-      );
+      // Try multiple location formats to handle spoken input
+      const locationVariants = this.normalizeLocation(location);
 
-      if (!geoResponse.ok) {
-        return `Unable to find location: ${location}`;
-      }
-
-      const geoData = await geoResponse.json() as {
+      let geoData: {
         results?: Array<{
           name: string;
           latitude: number;
@@ -39,9 +34,25 @@ export class WeatherTool implements Tool {
           country: string;
           admin1?: string;
         }>;
-      };
+      } | null = null;
 
-      if (!geoData.results || geoData.results.length === 0) {
+      // Try each variant until we get results
+      for (const variant of locationVariants) {
+        const geoResponse = await fetch(
+          `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(variant)}&count=1&language=en&format=json`
+        );
+
+        if (geoResponse.ok) {
+          const data = await geoResponse.json() as typeof geoData;
+          if (data?.results && data.results.length > 0) {
+            geoData = data;
+            console.log(`Geocoded "${location}" using variant: "${variant}"`);
+            break;
+          }
+        }
+      }
+
+      if (!geoData?.results || geoData.results.length === 0) {
         return `Could not find weather data for: ${location}`;
       }
 
@@ -76,6 +87,38 @@ export class WeatherTool implements Tool {
       console.error('Weather tool error:', error);
       return `Sorry, I encountered an error getting weather for ${location}`;
     }
+  }
+
+  // Normalize spoken location formats for better geocoding
+  // Handles: "Austin Texas" → "Austin, Texas", "New York" → "New York", etc.
+  private normalizeLocation(location: string): string[] {
+    const variants: string[] = [];
+
+    // Always try the original first
+    variants.push(location);
+
+    // If no comma, try adding one between words
+    if (!location.includes(',')) {
+      const words = location.trim().split(/\s+/);
+
+      if (words.length === 2) {
+        // "Austin Texas" → "Austin, Texas"
+        variants.push(`${words[0]}, ${words[1]}`);
+      } else if (words.length === 3) {
+        // "New York City" → try "New York City" (already added)
+        // "New York New York" → "New York, New York"
+        variants.push(`${words[0]} ${words[1]}, ${words[2]}`);
+        // Also try first two words only: "New York"
+        variants.push(`${words[0]} ${words[1]}`);
+      }
+
+      // Try just the first word as a fallback
+      if (words.length > 1) {
+        variants.push(words[0]);
+      }
+    }
+
+    return variants;
   }
 
   // Map WMO weather codes to descriptions
