@@ -57,47 +57,68 @@ export default {
       return updatePhoneNumber(request, env);
     }
 
+    // Get FreeClimb logs
+    if (url.pathname === '/logs' && request.method === 'GET') {
+      return getLogs(request, env);
+    }
+
     return new Response('Not Found', { status: 404 });
   },
 };
 
 async function handleIncomingCall(request: Request, env: Env): Promise<Response> {
-  const body = await request.json() as {
-    callId: string;
-    from: string;
-    to: string;
-    callStatus: string;
-  };
+  try {
+    const body = await request.json() as {
+      callId: string;
+      from: string;
+      to: string;
+      callStatus: string;
+    };
 
-  console.log(`Incoming call: ${body.callId} from ${body.from}`);
+    console.log(`Incoming call: ${body.callId} from ${body.from}`);
+    console.log('Full request body:', JSON.stringify(body));
 
-  // Route to appropriate app based on phone number
-  const app = registry.getForNumber(body.to);
+    // Route to appropriate app based on phone number
+    const app = registry.getForNumber(body.to);
 
-  if (!app) {
+    if (!app) {
+      console.log('No app found for number:', body.to);
+      return Response.json([
+        { Say: { text: 'No application configured for this number.' } },
+        { Hangup: {} },
+      ]);
+    }
+
+    console.log('Using app:', app.id, app.name);
+
+    // Initialize app context
+    const context: AppContext = {
+      env,
+      callId: body.callId,
+      from: body.from,
+      to: body.to,
+    };
+
+    // Call app's onStart handler
+    console.log('Calling app.onStart...');
+    const response = await app.onStart(context);
+    console.log('App response:', JSON.stringify(response));
+
+    // Convert app response to FreeClimb PerCL
+    const percl = buildPerCL(response, request.url);
+    console.log('PerCL to return:', JSON.stringify(percl));
+
+    return Response.json(percl, {
+      headers: { 'Content-Type': 'application/json' },
+    });
+  } catch (error) {
+    console.error('Error in handleIncomingCall:', error);
+    console.error('Error stack:', error instanceof Error ? error.stack : 'No stack trace');
     return Response.json([
-      { Say: { text: 'No application configured for this number.' } },
+      { Say: { text: 'Sorry, an error occurred. Please try again later.' } },
       { Hangup: {} },
-    ]);
+    ], { status: 500 });
   }
-
-  // Initialize app context
-  const context: AppContext = {
-    env,
-    callId: body.callId,
-    from: body.from,
-    to: body.to,
-  };
-
-  // Call app's onStart handler
-  const response = await app.onStart(context);
-
-  // Convert app response to FreeClimb PerCL
-  const percl = buildPerCL(response, request.url);
-
-  return Response.json(percl, {
-    headers: { 'Content-Type': 'application/json' },
-  });
 }
 
 async function handleTranscription(request: Request, env: Env): Promise<Response> {
@@ -164,18 +185,16 @@ function buildPerCL(response: any, baseUrl: string): any[] {
     });
   }
 
-  // If we should prompt for more speech, use RecordUtterance
+  // If we should prompt for more speech, use TranscribeUtterance
   if (response.prompt) {
     percl.push({
-      RecordUtterance: {
-        prompts: [
-          // RecordUtterance will automatically wait for speech
-        ],
+      TranscribeUtterance: {
         actionUrl: `${new URL(baseUrl).origin}/transcription`,
-        autoStart: true,
-        maxLengthSec: 30,
-        grammarType: 'URL',
-        grammarFile: 'builtin:speech/transcribe',  // FreeClimb's transcription grammar
+        playBeep: false,
+        record: {
+          maxLengthSec: 25,
+          rcrdTerminationSilenceTimeMs: 4000,
+        },
       },
     });
   }
@@ -444,5 +463,50 @@ async function updatePhoneNumber(request: Request, env: Env): Promise<Response> 
   } catch (error) {
     console.error('Update error:', error);
     return Response.json({ error: 'Update failed', details: String(error) }, { status: 500 });
+  }
+}
+
+async function getLogs(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const callId = url.searchParams.get('callId');
+
+  const accountId = env.FREECLIMB_ACCOUNT_ID;
+  const apiKey = env.FREECLIMB_API_KEY;
+  const auth = btoa(`${accountId}:${apiKey}`);
+  const apiBase = 'https://www.freeclimb.com/apiserver';
+
+  try {
+    let logsUrl: string;
+
+    if (callId) {
+      // Get logs for specific call
+      logsUrl = `${apiBase}/Accounts/${accountId}/Calls/${callId}/Logs`;
+    } else {
+      // Get recent logs (last 50)
+      logsUrl = `${apiBase}/Accounts/${accountId}/Logs`;
+    }
+
+    const response = await fetch(logsUrl, {
+      headers: {
+        'Authorization': `Basic ${auth}`,
+      },
+    });
+
+    if (!response.ok) {
+      const error = await response.text();
+      return Response.json({
+        error: 'Failed to fetch logs',
+        details: error,
+        url: logsUrl
+      }, { status: response.status });
+    }
+
+    const logs = await response.json();
+
+    return Response.json(logs);
+
+  } catch (error) {
+    console.error('Error fetching logs:', error);
+    return Response.json({ error: 'Failed to fetch logs', details: String(error) }, { status: 500 });
   }
 }
