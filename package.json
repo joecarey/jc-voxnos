@@ -1,0 +1,22 @@
+{
+  "name": "jc-voxnos",
+  "version": "1.0.0",
+  "description": "Simple IVR application using FreeClimb API",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "keywords": ["ivr", "freeclimb", "voice", "telephony"],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250117.0",
+    "@types/node": "^22.10.5",
+    "typescript": "^5.7.2",
+    "wrangler": "^3.105.0"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.47.10"
+  }
+}
