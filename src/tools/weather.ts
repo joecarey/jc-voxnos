@@ -39,14 +39,16 @@ export class WeatherTool implements Tool {
       // Try each variant until we get results
       for (const variant of locationVariants) {
         const geoResponse = await fetch(
-          `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(variant)}&count=1&language=en&format=json`
+          `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(variant)}&count=10&language=en&format=json`
         );
 
         if (geoResponse.ok) {
           const data = await geoResponse.json() as typeof geoData;
           if (data?.results && data.results.length > 0) {
-            geoData = data;
-            console.log(`Geocoded "${location}" using variant: "${variant}"`);
+            // If original input had multiple words, try to match the region/state/country
+            const bestMatch = this.findBestMatch(location, data.results);
+            geoData = { results: [bestMatch] };
+            console.log(`Geocoded "${location}" using variant: "${variant}" → ${bestMatch.name}, ${bestMatch.admin1 || ''}, ${bestMatch.country}`);
             break;
           }
         }
@@ -87,6 +89,41 @@ export class WeatherTool implements Tool {
       console.error('Weather tool error:', error);
       return `Sorry, I encountered an error getting weather for ${location}`;
     }
+  }
+
+  // Find the best matching location from multiple results
+  // Uses state/country hints from the original query
+  private findBestMatch(
+    originalLocation: string,
+    results: Array<{ name: string; admin1?: string; country: string }>
+  ): { name: string; latitude: number; longitude: number; country: string; admin1?: string } {
+    const words = originalLocation.toLowerCase().trim().split(/\s+/);
+
+    // If multiple words, use the last word(s) as a region hint
+    if (words.length >= 2) {
+      const regionHint = words.slice(1).join(' '); // "Austin Texas" → "texas"
+
+      // Try to match against admin1 (state/province) or country
+      for (const result of results as any[]) {
+        const admin1Lower = result.admin1?.toLowerCase() || '';
+        const countryLower = result.country.toLowerCase();
+
+        // Check for exact or partial match
+        if (
+          admin1Lower === regionHint ||
+          admin1Lower.includes(regionHint) ||
+          regionHint.includes(admin1Lower) ||
+          countryLower === regionHint ||
+          countryLower.includes(regionHint)
+        ) {
+          console.log(`Matched region hint "${regionHint}" to ${result.name}, ${result.admin1}, ${result.country}`);
+          return result;
+        }
+      }
+    }
+
+    // No region match found, return first (most populous/important)
+    return results[0] as any;
   }
 
   // Normalize spoken location formats for better geocoding
