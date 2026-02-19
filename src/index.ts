@@ -37,6 +37,11 @@ export default {
       return Response.json(apps);
     }
 
+    // List FreeClimb phone numbers
+    if (url.pathname === '/phone-numbers' && request.method === 'GET') {
+      return listPhoneNumbers(env);
+    }
+
     // Setup FreeClimb application and phone number
     if (url.pathname === '/setup' && request.method === 'POST') {
       return handleSetup(request, env);
@@ -181,6 +186,53 @@ function buildPerCL(response: any, baseUrl: string): any[] {
   }
 
   return percl;
+}
+
+async function listPhoneNumbers(env: Env): Promise<Response> {
+  const accountId = env.FREECLIMB_ACCOUNT_ID;
+  const apiKey = env.FREECLIMB_API_KEY;
+  const auth = btoa(`${accountId}:${apiKey}`);
+  const apiBase = 'https://api.freeclimb.com/apiserver';
+
+  try {
+    const response = await fetch(`${apiBase}/Accounts/${accountId}/IncomingPhoneNumbers`, {
+      headers: {
+        'Authorization': `Basic ${auth}`,
+      },
+    });
+
+    if (!response.ok) {
+      const error = await response.text();
+      return Response.json({ error: 'Failed to fetch phone numbers', details: error }, { status: 500 });
+    }
+
+    const data = await response.json() as {
+      incomingPhoneNumbers: Array<{
+        phoneNumberId: string;
+        phoneNumber: string;
+        alias: string;
+        voiceUrl?: string;
+        applicationId?: string;
+      }>;
+    };
+
+    const phoneNumbers = data.incomingPhoneNumbers || [];
+
+    return Response.json({
+      count: phoneNumbers.length,
+      phoneNumbers: phoneNumbers.map(n => ({
+        id: n.phoneNumberId,
+        number: n.phoneNumber,
+        alias: n.alias,
+        voiceUrl: n.voiceUrl,
+        applicationId: n.applicationId,
+      })),
+    });
+
+  } catch (error) {
+    console.error('Error fetching phone numbers:', error);
+    return Response.json({ error: 'Failed to fetch phone numbers', details: String(error) }, { status: 500 });
+  }
 }
 
 async function handleSetup(request: Request, env: Env): Promise<Response> {
