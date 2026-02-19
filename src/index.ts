@@ -62,6 +62,11 @@ export default {
       return getLogs(request, env);
     }
 
+    // Update FreeClimb application URLs
+    if (url.pathname === '/update-app' && request.method === 'POST') {
+      return updateApplication(request, env);
+    }
+
     return new Response('Not Found', { status: 404 });
   },
 };
@@ -526,5 +531,101 @@ async function getLogs(request: Request, env: Env): Promise<Response> {
   } catch (error) {
     console.error('Error fetching logs:', error);
     return Response.json({ error: 'Failed to fetch logs', details: String(error) }, { status: 500 });
+  }
+}
+
+async function updateApplication(request: Request, env: Env): Promise<Response> {
+  const baseUrl = new URL(request.url).origin;
+  const accountId = env.FREECLIMB_ACCOUNT_ID;
+  const apiKey = env.FREECLIMB_API_KEY;
+  const auth = btoa(`${accountId}:${apiKey}`);
+  const apiBase = 'https://www.freeclimb.com/apiserver';
+
+  try {
+    // Step 1: List all applications to find the Voxnos one
+    console.log('Fetching applications...');
+    const appsResponse = await fetch(`${apiBase}/Accounts/${accountId}/Applications`, {
+      headers: {
+        'Authorization': `Basic ${auth}`,
+      },
+    });
+
+    if (!appsResponse.ok) {
+      const error = await appsResponse.text();
+      return Response.json({ error: 'Failed to fetch applications', details: error }, { status: 500 });
+    }
+
+    const appsData = await appsResponse.json() as {
+      applications: Array<{
+        applicationId: string;
+        alias: string;
+        voiceUrl: string;
+        voiceFallbackUrl?: string;
+      }>;
+    };
+
+    const apps = appsData.applications || [];
+    const voxnosApp = apps.find(app => app.alias === 'Voxnos Platform');
+
+    if (!voxnosApp) {
+      return Response.json({
+        error: 'Voxnos Platform application not found',
+        availableApps: apps.map(a => ({ id: a.applicationId, name: a.alias })),
+      });
+    }
+
+    console.log(`Found Voxnos app: ${voxnosApp.applicationId}, current voiceUrl: ${voxnosApp.voiceUrl}`);
+
+    // Step 2: Update the application's voiceUrl
+    const newVoiceUrl = `${baseUrl}/call`;
+
+    if (voxnosApp.voiceUrl === newVoiceUrl) {
+      return Response.json({
+        message: 'Application already configured correctly',
+        application: {
+          id: voxnosApp.applicationId,
+          voiceUrl: voxnosApp.voiceUrl,
+        },
+      });
+    }
+
+    console.log(`Updating voiceUrl to: ${newVoiceUrl}`);
+    const updateResponse = await fetch(
+      `${apiBase}/Accounts/${accountId}/Applications/${voxnosApp.applicationId}`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Basic ${auth}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          voiceUrl: newVoiceUrl,
+          voiceFallbackUrl: newVoiceUrl,
+        }),
+      }
+    );
+
+    if (!updateResponse.ok) {
+      const error = await updateResponse.text();
+      return Response.json({ error: 'Failed to update application', details: error }, { status: 500 });
+    }
+
+    const updated = await updateResponse.json();
+
+    return Response.json({
+      success: true,
+      message: 'Application updated successfully',
+      before: {
+        voiceUrl: voxnosApp.voiceUrl,
+      },
+      after: {
+        voiceUrl: newVoiceUrl,
+      },
+      application: updated,
+    });
+
+  } catch (error) {
+    console.error('Update application error:', error);
+    return Response.json({ error: 'Update failed', details: String(error) }, { status: 500 });
   }
 }
