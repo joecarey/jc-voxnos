@@ -13,14 +13,14 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    // FreeClimb voice webhook - handles incoming calls
-    if (url.pathname === '/voice' && request.method === 'POST') {
+    // FreeClimb call webhook - handles incoming calls
+    if (url.pathname === '/call' && request.method === 'POST') {
       return handleIncomingCall(request, env);
     }
 
-    // FreeClimb transcription webhook - handles transcribed speech
-    if (url.pathname === '/transcription' && request.method === 'POST') {
-      return handleTranscription(request, env);
+    // FreeClimb conversation webhook - handles each turn of dialogue
+    if (url.pathname === '/conversation' && request.method === 'POST') {
+      return handleConversation(request, env);
     }
 
     // Health check
@@ -121,7 +121,7 @@ async function handleIncomingCall(request: Request, env: Env): Promise<Response>
   }
 }
 
-async function handleTranscription(request: Request, env: Env): Promise<Response> {
+async function handleConversation(request: Request, env: Env): Promise<Response> {
   const body = await request.json() as {
     callId: string;
     from: string;
@@ -133,8 +133,8 @@ async function handleTranscription(request: Request, env: Env): Promise<Response
     transcriptionDurationMs?: number;
   };
 
-  console.log(`Transcription webhook received:`, JSON.stringify(body));
-  console.log(`Transcription for call ${body.callId}:`, body.transcript);
+  console.log(`Conversation webhook received:`, JSON.stringify(body));
+  console.log(`User said (call ${body.callId}):`, body.transcript);
 
   // Route to app
   const app = registry.getForNumber(body.to);
@@ -164,7 +164,7 @@ async function handleTranscription(request: Request, env: Env): Promise<Response
       { Say: { text: "I didn't catch that. Could you please repeat?" } },
       {
         TranscribeUtterance: {
-          actionUrl: `${new URL(request.url).origin}/transcription`,
+          actionUrl: `${new URL(request.url).origin}/conversation`,
           playBeep: false,
           record: {
             maxLengthSec: 25,
@@ -192,19 +192,13 @@ async function handleTranscription(request: Request, env: Env): Promise<Response
 function buildPerCL(response: any, baseUrl: string): any[] {
   const percl: any[] = [];
 
-  // Say the response text with ElevenLabs
+  // Say the response text
   if (response.speech?.text) {
     percl.push({
       Say: {
         text: response.speech.text,
-        engine: {
-          name: 'ElevenLabs',
-          parameters: {
-            voice_id: 'EXAVITQu4vr4xnSDxMaL',  // Sarah - friendly female voice
-            language_code: 'en',
-            apply_text_normalization: 'on',
-          },
-        },
+        // TODO: Enable ElevenLabs once account is authorized
+        // Contact FreeClimb support to enable ElevenLabs TTS
       },
     });
   }
@@ -213,7 +207,7 @@ function buildPerCL(response: any, baseUrl: string): any[] {
   if (response.prompt) {
     percl.push({
       TranscribeUtterance: {
-        actionUrl: `${new URL(baseUrl).origin}/transcription`,
+        actionUrl: `${new URL(baseUrl).origin}/conversation`,
         playBeep: false,
         record: {
           maxLengthSec: 25,
@@ -352,8 +346,8 @@ async function handleSetup(request: Request, env: Env): Promise<Response> {
       },
       body: JSON.stringify({
         alias: 'Voxnos Platform',
-        voiceUrl: `${baseUrl}/voice`,
-        voiceFallbackUrl: `${baseUrl}/voice`,
+        voiceUrl: `${baseUrl}/call`,
+        voiceFallbackUrl: `${baseUrl}/call`,
       }),
     });
 
@@ -391,7 +385,7 @@ async function handleSetup(request: Request, env: Env): Promise<Response> {
     if (phoneNumbers.length === 0) {
       return Response.json({
         error: 'No phone numbers found',
-        application: { id: application.applicationId, voiceUrl: `${baseUrl}/voice` },
+        application: { id: application.applicationId, voiceUrl: `${baseUrl}/call` },
       });
     }
 
@@ -404,7 +398,7 @@ async function handleSetup(request: Request, env: Env): Promise<Response> {
       return Response.json({
         error: 'Phone number not found',
         available: phoneNumbers.map(n => n.phoneNumber),
-        application: { id: application.applicationId, voiceUrl: `${baseUrl}/voice` },
+        application: { id: application.applicationId, voiceUrl: `${baseUrl}/call` },
       });
     }
 
@@ -433,7 +427,7 @@ async function handleSetup(request: Request, env: Env): Promise<Response> {
       application: {
         id: application.applicationId,
         name: 'Voxnos Platform',
-        voiceUrl: `${baseUrl}/voice`,
+        voiceUrl: `${baseUrl}/call`,
       },
       phoneNumber: {
         id: targetNumber.phoneNumberId,
