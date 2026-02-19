@@ -1,12 +1,11 @@
-// FreeClimb IVR Application
-// Handles incoming calls with a simple menu system
+// Voxnos - Platform for building speech-enabled voice applications
 
-export interface Env {
-  SUPABASE_URL: string;
-  SUPABASE_SERVICE_ROLE_KEY: string;
-  FREECLIMB_ACCOUNT_ID: string;
-  FREECLIMB_API_KEY: string;
-}
+import { registry } from './core/registry.js';
+import { EchoApp } from './apps/echo.js';
+import type { Env, AppContext, SpeechInput } from './core/types.js';
+
+// Register apps
+registry.register(new EchoApp(), true);  // Default app
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -17,14 +16,23 @@ export default {
       return handleIncomingCall(request, env);
     }
 
-    // FreeClimb menu response - handles DTMF input
-    if (url.pathname === '/menu' && request.method === 'POST') {
-      return handleMenuResponse(request, env);
+    // FreeClimb transcription webhook - handles transcribed speech
+    if (url.pathname === '/transcription' && request.method === 'POST') {
+      return handleTranscription(request, env);
     }
 
     // Health check
     if (url.pathname === '/') {
-      return new Response('jc-voxnos running', { status: 200 });
+      return new Response('voxnos platform running', { status: 200 });
+    }
+
+    // List registered apps
+    if (url.pathname === '/apps') {
+      const apps = registry.list().map(app => ({
+        id: app.id,
+        name: app.name,
+      }));
+      return Response.json(apps);
     }
 
     return new Response('Not Found', { status: 404 });
@@ -32,9 +40,6 @@ export default {
 };
 
 async function handleIncomingCall(request: Request, env: Env): Promise<Response> {
-  console.log('Incoming call received');
-
-  // FreeClimb sends call data in the request body
   const body = await request.json() as {
     callId: string;
     from: string;
@@ -42,121 +47,131 @@ async function handleIncomingCall(request: Request, env: Env): Promise<Response>
     callStatus: string;
   };
 
-  console.log(`Call from ${body.from} to ${body.to}`);
+  console.log(`Incoming call: ${body.callId} from ${body.from}`);
 
-  // Build PerCL (FreeClimb's JSON command language) response
-  const percl = [
-    {
-      Say: {
-        text: 'Welcome to VoxNos. Press 1 for sales, Press 2 for support, or Press 0 for the operator.',
-      },
-    },
-    {
-      GetDigits: {
-        prompts: [
-          {
-            Say: {
-              text: 'Please make your selection now.',
-            },
-          },
-        ],
-        maxDigits: 1,
-        minDigits: 1,
-        flushBuffer: true,
-        actionUrl: `${new URL(request.url).origin}/menu`,
-      },
-    },
-  ];
+  // Route to appropriate app based on phone number
+  const app = registry.getForNumber(body.to);
+
+  if (!app) {
+    return Response.json([
+      { Say: { text: 'No application configured for this number.' } },
+      { Hangup: {} },
+    ]);
+  }
+
+  // Initialize app context
+  const context: AppContext = {
+    env,
+    callId: body.callId,
+    from: body.from,
+    to: body.to,
+  };
+
+  // Call app's onStart handler
+  const response = await app.onStart(context);
+
+  // Convert app response to FreeClimb PerCL
+  const percl = buildPerCL(response, request.url);
 
   return Response.json(percl, {
     headers: { 'Content-Type': 'application/json' },
   });
 }
 
-async function handleMenuResponse(request: Request, env: Env): Promise<Response> {
+async function handleTranscription(request: Request, env: Env): Promise<Response> {
   const body = await request.json() as {
     callId: string;
-    digits: string;
+    from: string;
+    to: string;
+    recordingId: string;
+    recordingUrl: string;
+    digits?: string;
     reason: string;
+    recognitionResult?: {
+      transcript: string;
+      confidence: number;
+    };
   };
 
-  console.log(`Menu selection: ${body.digits}`);
+  console.log(`Transcription for call ${body.callId}:`, body.recognitionResult?.transcript);
 
-  let percl;
+  // Route to app
+  const app = registry.getForNumber(body.to);
 
-  switch (body.digits) {
-    case '1':
-      percl = [
-        {
-          Say: {
-            text: 'Connecting you to sales.',
-          },
-        },
-        // In production, you'd use Redirect or OutDial to route the call
-        {
-          Say: {
-            text: 'Thank you for calling. Goodbye.',
-          },
-        },
-        {
-          Hangup: {},
-        },
-      ];
-      break;
-
-    case '2':
-      percl = [
-        {
-          Say: {
-            text: 'Connecting you to support.',
-          },
-        },
-        {
-          Say: {
-            text: 'Thank you for calling. Goodbye.',
-          },
-        },
-        {
-          Hangup: {},
-        },
-      ];
-      break;
-
-    case '0':
-      percl = [
-        {
-          Say: {
-            text: 'Transferring you to the operator.',
-          },
-        },
-        {
-          Say: {
-            text: 'Thank you for calling. Goodbye.',
-          },
-        },
-        {
-          Hangup: {},
-        },
-      ];
-      break;
-
-    default:
-      percl = [
-        {
-          Say: {
-            text: 'Invalid selection. Please try again.',
-          },
-        },
-        {
-          Redirect: {
-            actionUrl: `${new URL(request.url).origin}/voice`,
-          },
-        },
-      ];
-      break;
+  if (!app) {
+    return Response.json([{ Hangup: {} }]);
   }
+
+  // Build context
+  const context: AppContext = {
+    env,
+    callId: body.callId,
+    from: body.from,
+    to: body.to,
+  };
+
+  // Build speech input from transcription
+  const input: SpeechInput = {
+    text: body.recognitionResult?.transcript ?? '',
+    confidence: body.recognitionResult?.confidence,
+  };
+
+  // Call app's onSpeech handler
+  const response = await app.onSpeech(context, input);
+
+  // Convert to PerCL
+  const percl = buildPerCL(response, request.url);
 
   return Response.json(percl, {
     headers: { 'Content-Type': 'application/json' },
   });
+}
+
+// Convert app response to FreeClimb PerCL commands
+function buildPerCL(response: any, baseUrl: string): any[] {
+  const percl: any[] = [];
+
+  // Say the response text
+  if (response.speech?.text) {
+    percl.push({
+      Say: {
+        text: response.speech.text,
+        voice: response.speech.voice,
+        language: response.speech.language,
+      },
+    });
+  }
+
+  // If we should prompt for more speech, use RecordUtterance
+  if (response.prompt) {
+    percl.push({
+      RecordUtterance: {
+        prompts: [
+          // RecordUtterance will automatically wait for speech
+        ],
+        actionUrl: `${new URL(baseUrl).origin}/transcription`,
+        autoStart: true,
+        maxLengthSec: 30,
+        grammarType: 'URL',
+        grammarFile: 'builtin:speech/transcribe',  // FreeClimb's transcription grammar
+      },
+    });
+  }
+
+  // Hang up if requested
+  if (response.hangup) {
+    percl.push({ Hangup: {} });
+  }
+
+  // Transfer if requested
+  if (response.transfer) {
+    percl.push({
+      OutDial: {
+        destination: response.transfer,
+        callConnectUrl: `${new URL(baseUrl).origin}/transfer`,
+      },
+    });
+  }
+
+  return percl;
 }

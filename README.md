@@ -1,13 +1,79 @@
 # jc-voxnos
 
-Simple IVR (Interactive Voice Response) application using FreeClimb API.
+Platform for building speech-enabled voice applications using FreeClimb API.
+
+## Concept
+
+Voxnos is a **platform**, not a single IVR. It lets you build multiple **apps** that handle phone calls using:
+- **Speech input** - Transcription instead of DTMF keypad
+- **Speech output** - Text-to-speech synthesis
+- **Conversational flow** - Open-ended dialogues, not just menus
+
+## Architecture
+
+```
+Phone Call → FreeClimb → Voxnos Platform → App Router → Your App
+                                 ↓
+                            Speech I/O Layer
+                         (Transcription + TTS)
+```
+
+## Building an App
+
+Apps implement the `VoxnosApp` interface:
+
+```typescript
+import type { VoxnosApp, AppContext, SpeechInput, AppResponse } from './core/types.js';
+
+export class MyApp implements VoxnosApp {
+  id = 'my-app';
+  name = 'My Voice App';
+
+  // Called when call starts
+  async onStart(context: AppContext): Promise<AppResponse> {
+    return {
+      speech: { text: 'Welcome! How can I help you?' },
+      prompt: true,  // Listen for caller's response
+    };
+  }
+
+  // Called when caller speaks
+  async onSpeech(context: AppContext, input: SpeechInput): Promise<AppResponse> {
+    // Process input.text (transcribed speech)
+    // Return response
+    return {
+      speech: { text: `You said: ${input.text}` },
+      prompt: true,   // Keep listening
+      hangup: false,  // Don't hang up yet
+    };
+  }
+
+  // Optional: Called when call ends
+  async onEnd(context: AppContext): Promise<void> {
+    console.log('Call ended');
+  }
+}
+```
+
+Register your app in `src/index.ts`:
+
+```typescript
+import { MyApp } from './apps/my-app.js';
+registry.register(new MyApp(), true);  // true = default app
+```
+
+## Included Apps
+
+- **Echo App** (`src/apps/echo.ts`) - Simple demo that repeats what you say
 
 ## Stack
 
-- **Cloudflare Workers** - Serverless hosting for webhook handlers
-- **FreeClimb API** - Cloud telephony platform
+- **Cloudflare Workers** - Serverless hosting
+- **FreeClimb API** - Telephony platform
+  - `RecordUtterance` - Speech transcription
+  - `Say` - Text-to-speech
 - **TypeScript** - Type-safe development
-- **Supabase** - Database (for call logs, future features)
+- **Supabase** - Database (for sessions, logs, config)
 
 ## Setup
 
@@ -19,20 +85,17 @@ npm install
 
 ### 2. Configure FreeClimb
 
-1. Sign up for a FreeClimb account at https://www.freeclimb.com/
-2. Get your Account ID and API Key from the dashboard
+1. Sign up at https://www.freeclimb.com/
+2. Get Account ID and API Key
 3. Purchase a phone number
-4. Configure the phone number's voice URL to point to your deployed worker:
-   - Voice URL: `https://jc-voxnos.YOUR_SUBDOMAIN.workers.dev/voice`
+4. Configure phone number:
+   - **Voice URL**: `https://jc-voxnos.YOUR_SUBDOMAIN.workers.dev/voice`
 
 ### 3. Set environment variables
 
 ```bash
-# Supabase
 npx wrangler secret put SUPABASE_URL
 npx wrangler secret put SUPABASE_SERVICE_ROLE_KEY
-
-# FreeClimb
 npx wrangler secret put FREECLIMB_ACCOUNT_ID
 npx wrangler secret put FREECLIMB_API_KEY
 ```
@@ -49,31 +112,41 @@ npm run deploy
 npm run dev
 ```
 
-For local testing with FreeClimb webhooks, use [ngrok](https://ngrok.com/) or [cloudflared tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/):
+For local testing with FreeClimb, expose via tunnel:
 
 ```bash
 cloudflared tunnel --url http://localhost:8787
 ```
 
-Then update your FreeClimb phone number's voice URL to the tunnel URL.
+Update FreeClimb phone number voice URL to tunnel URL.
 
-## Current Features
+## API Endpoints
 
-- **Simple IVR menu** - Press 1 for sales, 2 for support, 0 for operator
-- **Text-to-speech** - Uses FreeClimb's built-in TTS
-- **DTMF input handling** - Captures and routes based on key presses
+- `GET /` - Health check
+- `GET /apps` - List registered apps
+- `POST /voice` - FreeClimb incoming call webhook
+- `POST /transcription` - FreeClimb transcription webhook
+
+## Use Cases
+
+- **Voice assistants** - Conversational AI with Claude API
+- **Surveys** - Collect feedback via voice
+- **Appointment scheduling** - Book/modify appointments
+- **Information hotlines** - Answer questions
+- **Call routing** - Intelligent call distribution
+- **Voicemail** - Custom voicemail systems
 
 ## Next Steps
 
-- [ ] Add call logging to Supabase
-- [ ] Implement call forwarding to real numbers
-- [ ] Add voicemail recording
-- [ ] Build call analytics dashboard
-- [ ] Integrate with Claude API for conversational IVR
+- [ ] Add database schema for sessions/messages
+- [ ] Implement session state management
+- [ ] Create Claude API integration app
+- [ ] Add analytics/logging
+- [ ] Phone number → app mapping in database
+- [ ] Build admin dashboard
 
-## FreeClimb Documentation
+## Documentation
 
-- [PerCL Commands](https://docs.freeclimb.com/reference/percl-overview)
-- [Webhooks](https://docs.freeclimb.com/docs/webhooks-overview)
-- [Say Command](https://docs.freeclimb.com/reference/say-1)
-- [GetDigits Command](https://docs.freeclimb.com/reference/getdigits)
+- [FreeClimb RecordUtterance](https://docs.freeclimb.com/reference/recordutterance)
+- [FreeClimb Say](https://docs.freeclimb.com/reference/say-1)
+- [PerCL Overview](https://docs.freeclimb.com/reference/percl-overview)
