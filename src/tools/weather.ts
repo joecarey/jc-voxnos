@@ -134,24 +134,32 @@ export class WeatherTool implements Tool {
     // Always try the original first
     variants.push(location);
 
-    // If no comma, try adding one between words
-    if (!location.includes(',')) {
-      const words = location.trim().split(/\s+/);
+    // Split into words (handle both comma-separated and space-separated)
+    const parts = location.split(',').map(p => p.trim());
+    const words = parts.length > 1
+      ? parts[0].split(/\s+/)  // "Austin, Texas" → ["Austin"]
+      : location.split(/\s+/);  // "Austin Texas" → ["Austin", "Texas"]
 
+    if (location.includes(',')) {
+      // Has comma: "Austin, Texas" or "New York, New York"
+      // Try without comma as fallback
+      if (parts.length === 2) {
+        variants.push(`${parts[0]} ${parts[1]}`);  // "Austin, Texas" → "Austin Texas"
+        variants.push(parts[0]);  // Just city: "Austin"
+      }
+    } else {
+      // No comma: "Austin Texas" or "New York City"
       if (words.length === 2) {
         // "Austin Texas" → "Austin, Texas"
         variants.push(`${words[0]}, ${words[1]}`);
+        variants.push(words[0]);  // Fallback to just city
       } else if (words.length === 3) {
-        // "New York City" → try "New York City" (already added)
-        // "New York New York" → "New York, New York"
+        // "New York City" or "New York New York"
         variants.push(`${words[0]} ${words[1]}, ${words[2]}`);
-        // Also try first two words only: "New York"
         variants.push(`${words[0]} ${words[1]}`);
-      }
-
-      // Try just the first word as a fallback
-      if (words.length > 1) {
         variants.push(words[0]);
+      } else if (words.length > 1) {
+        variants.push(words[0]);  // Fallback to first word
       }
     }
 
