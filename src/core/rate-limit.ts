@@ -31,7 +31,10 @@ export const RATE_LIMITS = {
 };
 
 /**
- * Check rate limit using sliding window algorithm
+ * Check rate limit using fixed-window counter.
+ *
+ * Each window is identified by floor(now / windowSeconds), so all requests
+ * within the same window share one KV counter. Requires a single KV read + write.
  *
  * @param kv - KV namespace binding
  * @param identifier - Unique identifier (callId, IP, admin key, etc.)
@@ -53,54 +56,30 @@ export async function checkRateLimit(
     };
   }
 
-  const now = Date.now();
-  const windowStart = now - config.windowSeconds * 1000;
-
-  // Create time bucket (round to nearest second)
-  const timeBucket = Math.floor(now / 1000);
-  const kvKey = `${config.keyPrefix}:${identifier}:${timeBucket}`;
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const windowBucket = Math.floor(nowSeconds / config.windowSeconds);
+  const kvKey = `${config.keyPrefix}:${identifier}:${windowBucket}`;
+  const resetAt = (windowBucket + 1) * config.windowSeconds * 1000;
 
   try {
-    // Get current count for this second
-    const currentCountStr = await kv.get(kvKey);
-    const currentCount = currentCountStr ? parseInt(currentCountStr, 10) : 0;
+    const countStr = await kv.get(kvKey);
+    const count = countStr ? parseInt(countStr, 10) : 0;
 
-    // Count requests in the sliding window
-    let totalCount = currentCount;
-
-    // Check previous buckets within the window (last N seconds)
-    const bucketsToCheck = Math.min(10, config.windowSeconds); // Check last 10 seconds
-    for (let i = 1; i <= bucketsToCheck; i++) {
-      const prevBucket = timeBucket - i;
-      const prevKey = `${config.keyPrefix}:${identifier}:${prevBucket}`;
-      const prevCountStr = await kv.get(prevKey);
-      if (prevCountStr) {
-        totalCount += parseInt(prevCountStr, 10);
-      }
-    }
-
-    // Check if limit exceeded
-    if (totalCount >= config.maxRequests) {
+    if (count >= config.maxRequests) {
       return {
         allowed: false,
         remaining: 0,
-        resetAt: now + config.windowSeconds * 1000,
+        resetAt,
         error: 'Rate limit exceeded',
       };
     }
 
-    // Increment counter for current bucket
-    const newCount = currentCount + 1;
-    await kv.put(
-      kvKey,
-      String(newCount),
-      { expirationTtl: config.windowSeconds + 60 } // TTL with 60s buffer
-    );
+    await kv.put(kvKey, String(count + 1), { expirationTtl: config.windowSeconds * 2 });
 
     return {
       allowed: true,
-      remaining: config.maxRequests - totalCount - 1,
-      resetAt: now + config.windowSeconds * 1000,
+      remaining: config.maxRequests - count - 1,
+      resetAt,
     };
   } catch (error) {
     // If KV operation fails, fail open (allow request) but log the error
@@ -108,7 +87,7 @@ export async function checkRateLimit(
     return {
       allowed: true,
       remaining: config.maxRequests,
-      resetAt: now + config.windowSeconds * 1000,
+      resetAt,
     };
   }
 }
