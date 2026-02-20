@@ -1,6 +1,6 @@
 # jc-voxnos
 
-> **Part of the [platform](https://github.com/yourusername/platform) ecosystem** | See [Platform Overview](https://github.com/yourusername/platform/blob/main/docs/PLATFORM-OVERVIEW.md) for architecture
+> **Part of the [platform](https://github.com/joecarey/platform) ecosystem** | See [Platform Overview](https://github.com/joecarey/platform/blob/main/docs/PLATFORM-OVERVIEW.md) for architecture
 
 Voice interaction framework for building speech-enabled applications using FreeClimb API.
 
