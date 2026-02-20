@@ -6,9 +6,11 @@ import { ClaudeAssistant } from './apps/claude-assistant.js';
 import type { Env, AppContext, SpeechInput } from './core/types.js';
 import { toolRegistry } from './tools/registry.js';
 import { WeatherTool } from './tools/weather.js';
+import { CognosTool } from './tools/cognos.js';
 
 // Register tools
 toolRegistry.register(new WeatherTool());
+toolRegistry.register(new CognosTool());
 
 // Register apps
 registry.register(new EchoApp());                // Simple echo demo
