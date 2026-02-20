@@ -5,6 +5,7 @@ export interface Env {
   SUPABASE_SERVICE_ROLE_KEY: string;
   FREECLIMB_ACCOUNT_ID: string;
   FREECLIMB_API_KEY: string;
+  ANTHROPIC_API_KEY: string;
 }
 
 export interface AppContext {

@@ -26,7 +26,7 @@ export class WeatherTool implements Tool {
       // Try multiple location formats to handle spoken input
       const locationVariants = this.normalizeLocation(location);
 
-      let geoData: {
+      type GeoData = {
         results?: Array<{
           name: string;
           latitude: number;
@@ -34,7 +34,9 @@ export class WeatherTool implements Tool {
           country: string;
           admin1?: string;
         }>;
-      } | null = null;
+      };
+
+      let geoData: GeoData | null = null;
 
       // Try each variant until we get results
       for (const variant of locationVariants) {
@@ -43,7 +45,7 @@ export class WeatherTool implements Tool {
         );
 
         if (geoResponse.ok) {
-          const data = await geoResponse.json() as typeof geoData;
+          const data = await geoResponse.json() as GeoData;
           if (data?.results && data.results.length > 0) {
             // If original input had multiple words, try to match the region/state/country
             const bestMatch = this.findBestMatch(location, data.results);
