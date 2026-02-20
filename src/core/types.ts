@@ -6,6 +6,8 @@ export interface Env {
   FREECLIMB_ACCOUNT_ID: string;
   FREECLIMB_API_KEY: string;
   ANTHROPIC_API_KEY: string;
+  ADMIN_API_KEY: string;
+  RATE_LIMIT_KV: KVNamespace;
 }
 
 export interface AppContext {

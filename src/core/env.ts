@@ -11,6 +11,7 @@ const REQUIRED_ENV_VARS = [
   'FREECLIMB_ACCOUNT_ID',
   'FREECLIMB_API_KEY',
   'ANTHROPIC_API_KEY',
+  'ADMIN_API_KEY',
 ] as const;
 
 /**

@@ -1,6 +1,8 @@
 # jc-voxnos
 
-Platform for building speech-enabled voice applications using FreeClimb API.
+> **Part of the [platform](https://github.com/yourusername/platform) ecosystem** | See [Platform Overview](https://github.com/yourusername/platform/blob/main/docs/PLATFORM-OVERVIEW.md) for architecture
+
+Voice interaction framework for building speech-enabled applications using FreeClimb API.
 
 ## Concept
 

@@ -27,6 +27,7 @@ export class CognosTool implements Tool {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'Authorization': 'Bearer XkWHzrJZ3g9RwX/BixO6z2XW4xyZxTvIEo7FInRU774=',  // PUBLIC_API_KEY
         },
         body: JSON.stringify({
           q: topic,
