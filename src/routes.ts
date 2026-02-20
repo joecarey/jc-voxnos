@@ -16,21 +16,18 @@ export async function handleIncomingCall(request: Request, env: Env): Promise<Re
       callStatus: string;
     };
 
-    console.log(`Incoming call: ${body.callId} from ${body.from}`);
-    console.log('Full request body:', JSON.stringify(body));
+    console.log(JSON.stringify({ event: 'call_incoming', callId: body.callId, from: body.from, to: body.to, timestamp: new Date().toISOString() }));
 
     // Route to appropriate app based on phone number
     const app = registry.getForNumber(body.to);
 
     if (!app) {
-      console.log('No app found for number:', body.to);
+      console.log(JSON.stringify({ event: 'call_no_app', to: body.to, timestamp: new Date().toISOString() }));
       return Response.json([
         { Say: { text: 'No application configured for this number.' } },
         { Hangup: {} },
       ]);
     }
-
-    console.log('Using app:', app.id, app.name);
 
     // Initialize app context
     const context: AppContext = {
@@ -40,14 +37,10 @@ export async function handleIncomingCall(request: Request, env: Env): Promise<Re
       to: body.to,
     };
 
-    // Call app's onStart handler
-    console.log('Calling app.onStart...');
     const response = await app.onStart(context);
-    console.log('App response:', JSON.stringify(response));
 
     // Convert app response to FreeClimb PerCL
     const percl = buildPerCL(response, request.url);
-    console.log('PerCL to return:', JSON.stringify(percl));
 
     return Response.json(percl, {
       headers: { 'Content-Type': 'application/json' },
@@ -77,8 +70,7 @@ export async function handleConversation(request: Request, env: Env): Promise<Re
     transcriptionDurationMs?: number;
   };
 
-  console.log(`Conversation webhook received:`, JSON.stringify(body));
-  console.log(`User said (call ${body.callId}):`, body.transcript);
+  console.log(JSON.stringify({ event: 'conversation_turn', callId: body.callId, transcript_length: body.transcript?.length ?? 0, timestamp: new Date().toISOString() }));
 
   // Route to app
   const app = registry.getForNumber(body.to);
@@ -103,7 +95,6 @@ export async function handleConversation(request: Request, env: Env): Promise<Re
 
   // If no transcription, ask to repeat
   if (!input.text || input.text.trim() === '') {
-    console.log('No transcription received, asking user to repeat');
     return Response.json([
       { Say: { text: "I didn't catch that. Could you please repeat?" } },
       {

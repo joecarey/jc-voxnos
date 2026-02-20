@@ -199,6 +199,22 @@ export default {
       return handleUpdateApplication(request, env);
     }
 
+    // Cost tracking summary
+    if (url.pathname === '/costs' && request.method === 'GET') {
+      const auth = requireAdminAuth(request, env);
+      if (!auth.authorized) return createUnauthorizedResponse(auth.error!);
+
+      const days: Array<{ date: string; input_tokens: number; output_tokens: number; requests: number }> = [];
+      for (let i = 0; i < 14; i++) {
+        const d = new Date();
+        d.setUTCDate(d.getUTCDate() - i);
+        const date = d.toISOString().split('T')[0];
+        const val = await env.RATE_LIMIT_KV.get(`costs:voxnos:${date}`, 'json') as { input_tokens: number; output_tokens: number; requests: number } | null;
+        days.push({ date, input_tokens: val?.input_tokens ?? 0, output_tokens: val?.output_tokens ?? 0, requests: val?.requests ?? 0 });
+      }
+      return Response.json({ service: 'voxnos', days });
+    }
+
     return new Response('Not Found', { status: 404 });
   },
 };

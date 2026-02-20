@@ -19,17 +19,34 @@ interface Message {
   content: string | ContentBlock[];
 }
 
-// Simple in-memory conversation storage (callId -> messages)
-// TODO: Move to Supabase for persistence
-const conversations = new Map<string, Message[]>();
+// Simple in-memory conversation storage with TTL
+const CONVERSATION_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const conversations = new Map<string, { messages: Message[]; lastActive: number }>();
+
+function pruneConversations(): void {
+  const now = Date.now();
+  for (const [id, data] of conversations.entries()) {
+    if (now - data.lastActive > CONVERSATION_TTL_MS) {
+      conversations.delete(id);
+    }
+  }
+}
 
 export class ClaudeAssistant implements VoxnosApp {
   id = 'claude-assistant';
   name = 'Claude Voice Assistant';
 
   async onStart(context: AppContext): Promise<AppResponse> {
-    // Initialize conversation history
-    conversations.set(context.callId, []);
+    pruneConversations();
+    conversations.set(context.callId, { messages: [], lastActive: Date.now() });
+
+    console.log(JSON.stringify({
+      event: 'call_start',
+      callId: context.callId,
+      from: context.from,
+      app: this.id,
+      timestamp: new Date().toISOString(),
+    }));
 
     return {
       speech: {
@@ -53,19 +70,20 @@ export class ClaudeAssistant implements VoxnosApp {
     }
 
     // Get conversation history
-    const history = conversations.get(context.callId) || [];
+    const entry = conversations.get(context.callId);
+    const messages = entry?.messages ?? [];
 
     // Add user message to history
-    history.push({
+    messages.push({
       role: 'user',
       content: userMessage,
     });
 
     // Call Claude API (with tool support)
-    const assistantResponse = await this.callClaude(context, history);
+    const assistantResponse = await this.callClaude(context, messages);
 
-    // Update conversation
-    conversations.set(context.callId, history);
+    // Update conversation with refreshed timestamp
+    conversations.set(context.callId, { messages, lastActive: Date.now() });
 
     return {
       speech: {
@@ -76,9 +94,12 @@ export class ClaudeAssistant implements VoxnosApp {
   }
 
   async onEnd(context: AppContext): Promise<void> {
-    // Clean up conversation history
     conversations.delete(context.callId);
-    console.log(`Claude assistant call ended: ${context.callId}`);
+    console.log(JSON.stringify({
+      event: 'call_end',
+      callId: context.callId,
+      timestamp: new Date().toISOString(),
+    }));
   }
 
   private async callClaude(context: AppContext, history: Message[]): Promise<string> {
@@ -93,6 +114,9 @@ export class ClaudeAssistant implements VoxnosApp {
     try {
       let continueLoop = true;
       let finalText = '';
+      let totalInputTokens = 0;
+      let totalOutputTokens = 0;
+      let apiCalls = 0;
 
       // Tool use may require multiple API calls
       while (continueLoop) {
@@ -105,7 +129,7 @@ export class ClaudeAssistant implements VoxnosApp {
           },
           body: JSON.stringify({
             model: 'claude-sonnet-4-5-20250929',
-            max_tokens: 300,  // Slightly higher for tool use
+            max_tokens: 300,
             system: systemPrompt,
             messages: history,
             tools: toolRegistry.getDefinitions(),
@@ -113,16 +137,19 @@ export class ClaudeAssistant implements VoxnosApp {
         });
 
         if (!response.ok) {
-          console.error('Claude API error:', response.status);
+          console.error(JSON.stringify({ event: 'claude_api_error', callId: context.callId, status: response.status, timestamp: new Date().toISOString() }));
           return 'I\'m sorry, I\'m having trouble processing that right now. Could you try again?';
         }
 
         const data = await response.json() as {
           content: ContentBlock[];
           stop_reason: string;
+          usage: { input_tokens: number; output_tokens: number };
         };
 
-        console.log('Claude response:', JSON.stringify(data));
+        apiCalls++;
+        totalInputTokens += data.usage?.input_tokens ?? 0;
+        totalOutputTokens += data.usage?.output_tokens ?? 0;
 
         // Process response content
         const assistantContent: ContentBlock[] = [];
@@ -135,12 +162,9 @@ export class ClaudeAssistant implements VoxnosApp {
           } else if (block.type === 'tool_use') {
             assistantContent.push(block);
 
-            // Execute the tool
-            console.log(`Executing tool: ${block.name} with input:`, block.input);
+            console.log(JSON.stringify({ event: 'tool_execute', callId: context.callId, tool: block.name, timestamp: new Date().toISOString() }));
             const toolResult = await toolRegistry.execute(block.name!, block.input!);
-            console.log(`Tool result:`, toolResult);
 
-            // Prepare tool result for next turn
             toolResults.push({
               type: 'tool_result',
               tool_use_id: block.id!,
@@ -161,11 +185,23 @@ export class ClaudeAssistant implements VoxnosApp {
             role: 'user',
             content: toolResults,
           });
-          continueLoop = true;  // Make another API call with tool results
+          continueLoop = true;
         } else {
-          continueLoop = false;  // Done
+          continueLoop = false;
         }
       }
+
+      console.log(JSON.stringify({
+        event: 'claude_turn_complete',
+        callId: context.callId,
+        api_calls: apiCalls,
+        input_tokens: totalInputTokens,
+        output_tokens: totalOutputTokens,
+        timestamp: new Date().toISOString(),
+      }));
+
+      // Fire-and-forget daily cost tracking
+      this.trackDailyCost(context.env.RATE_LIMIT_KV, totalInputTokens, totalOutputTokens).catch(() => {});
 
       return finalText || 'I didn\'t catch that. Could you repeat?';
 
@@ -201,5 +237,24 @@ export class ClaudeAssistant implements VoxnosApp {
            lower.includes('hang up') ||
            lower === 'exit' ||
            lower === 'quit';
+  }
+
+  private async trackDailyCost(kv: KVNamespace, inputTokens: number, outputTokens: number): Promise<void> {
+    const date = new Date().toISOString().split('T')[0];
+    const key = `costs:voxnos:${date}`;
+
+    const existing = await kv.get(key, 'json') as {
+      input_tokens: number;
+      output_tokens: number;
+      requests: number;
+    } | null;
+
+    const updated = {
+      input_tokens: (existing?.input_tokens ?? 0) + inputTokens,
+      output_tokens: (existing?.output_tokens ?? 0) + outputTokens,
+      requests: (existing?.requests ?? 0) + 1,
+    };
+
+    await kv.put(key, JSON.stringify(updated), { expirationTtl: 90 * 24 * 60 * 60 });
   }
 }
