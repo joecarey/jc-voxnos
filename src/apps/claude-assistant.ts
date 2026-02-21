@@ -2,7 +2,33 @@
 
 import type { VoxnosApp, AppContext, SpeechInput, AppResponse } from '../core/types.js';
 import { toolRegistry } from '../tools/registry.js';
-import type { ToolUseRequest } from '../tools/types.js';
+
+// Retryable HTTP status codes for Anthropic API calls
+const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
+
+/**
+ * Fetch with exponential backoff retry for transient Anthropic API failures.
+ * Uses shorter delays than cognos (500ms, 2s) to minimize caller wait time.
+ */
+async function fetchWithRetry(url: string, init: RequestInit): Promise<Response> {
+  const RETRY_DELAYS_MS = [500, 2000]; // 2 retries: 0.5s, 2s
+  for (let attempt = 0; attempt < 1 + RETRY_DELAYS_MS.length; attempt++) {
+    if (attempt > 0) {
+      await new Promise<void>(resolve => setTimeout(resolve, RETRY_DELAYS_MS[attempt - 1]));
+    }
+    try {
+      const response = await fetch(url, init);
+      if (!response.ok && RETRYABLE_STATUSES.has(response.status) && attempt < RETRY_DELAYS_MS.length) {
+        continue;
+      }
+      return response;
+    } catch (networkErr) {
+      if (attempt < RETRY_DELAYS_MS.length) continue;
+      throw networkErr;
+    }
+  }
+  throw new Error('Anthropic API max retries exceeded');
+}
 
 interface ContentBlock {
   type: 'text' | 'tool_use' | 'tool_result';
@@ -120,7 +146,7 @@ export class ClaudeAssistant implements VoxnosApp {
 
       // Tool use may require multiple API calls
       while (continueLoop) {
-        const response = await fetch('https://api.anthropic.com/v1/messages', {
+        const response = await fetchWithRetry('https://api.anthropic.com/v1/messages', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',

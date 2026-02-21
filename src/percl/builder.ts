@@ -40,6 +40,19 @@ export interface AppResponse {
 }
 
 /**
+ * Sanitize text before sending to TTS.
+ * Strips SSML/HTML tags and entities that could cause unexpected TTS behavior
+ * if injected via user speech → Claude response path.
+ */
+function sanitizeForTTS(text: string): string {
+  return text
+    .replace(/<[^>]+>/g, '')    // strip SSML/HTML tags
+    .replace(/&[a-z]+;/gi, '')  // strip HTML entities (&amp; &lt; etc.)
+    .trim()
+    .slice(0, 2000);            // cap length — FreeClimb Say has practical limits
+}
+
+/**
  * Default TTS provider (ElevenLabs with Sarah voice)
  */
 const DEFAULT_TTS_PROVIDER = new ElevenLabsProvider({
@@ -63,16 +76,18 @@ export function buildPerCL(
   const percl: PerCLCommand[] = [];
   const origin = new URL(baseUrl).origin;
 
-  // Say the response text
+  // Say the response text (sanitized before sending to TTS)
   if (response.speech?.text) {
-    const engineConfig = ttsProvider.getEngineConfig(response.speech.text);
-    const sayCommand: PerCLCommand = {
-      Say: {
-        text: response.speech.text,
-        ...(engineConfig ? { engine: engineConfig } : {}),
-      },
-    };
-    percl.push(sayCommand);
+    const safeText = sanitizeForTTS(response.speech.text);
+    if (safeText) {
+      const engineConfig = ttsProvider.getEngineConfig(safeText);
+      percl.push({
+        Say: {
+          text: safeText,
+          ...(engineConfig ? { engine: engineConfig } : {}),
+        },
+      });
+    }
   }
 
   // If we should prompt for more speech, use TranscribeUtterance
