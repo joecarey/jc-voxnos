@@ -2,7 +2,18 @@
 
 import { registry } from './core/registry.js';
 import type { Env, AppContext, SpeechInput } from './core/types.js';
-import { buildPerCL } from './percl/builder.js';
+import { buildPerCL, sanitizeForTTS } from './percl/builder.js';
+import { ElevenLabsProvider, DirectElevenLabsProvider, ELEVENLABS_VOICE_ID, callElevenLabs } from './tts/index.js';
+
+function getTTSProvider(env: Env) {
+  if (env.TTS_MODE === 'direct') {
+    return new DirectElevenLabsProvider({
+      voiceId: ELEVENLABS_VOICE_ID,
+      signingSecret: env.TTS_SIGNING_SECRET,
+    });
+  }
+  return new ElevenLabsProvider({ voiceId: 'EXAVITQu4vr4xnSDxMaL', languageCode: 'en' });
+}
 
 /**
  * FreeClimb call webhook - handles incoming calls
@@ -40,7 +51,7 @@ export async function handleIncomingCall(request: Request, env: Env): Promise<Re
     const response = await app.onStart(context);
 
     // Convert app response to FreeClimb PerCL
-    const percl = buildPerCL(response, request.url);
+    const percl = await buildPerCL(response, request.url, getTTSProvider(env));
 
     return Response.json(percl, {
       headers: { 'Content-Type': 'application/json' },
@@ -56,9 +67,38 @@ export async function handleIncomingCall(request: Request, env: Env): Promise<Re
 }
 
 /**
+ * Background processor for sentences 2+ in the V2 streaming path.
+ * Runs inside ctx.waitUntil() after routes.ts returns the first-sentence response.
+ * Stores each sentence's audio in KV and marks the stream as done when finished.
+ */
+async function processRemainingStream(
+  sentenceStream: AsyncGenerator<string, void, undefined>,
+  callKey: string,
+  env: Env,
+  startIndex: number,
+): Promise<void> {
+  let n = startIndex;
+  try {
+    for await (const sentence of sentenceStream) {
+      n++;
+      const safeSentence = sanitizeForTTS(sentence);
+      if (!safeSentence) continue;
+      const audio = await callElevenLabs(safeSentence, env.ELEVENLABS_API_KEY);
+      const id = crypto.randomUUID();
+      await env.RATE_LIMIT_KV.put(`tts:${id}`, audio, { expirationTtl: 120 });
+      await env.RATE_LIMIT_KV.put(`${callKey}:${n}`, id, { expirationTtl: 120 });
+    }
+  } catch (err) {
+    console.error('processRemainingStream error:', err);
+  } finally {
+    await env.RATE_LIMIT_KV.put(`${callKey}:done`, '1', { expirationTtl: 120 });
+  }
+}
+
+/**
  * FreeClimb conversation webhook - handles each turn of dialogue
  */
-export async function handleConversation(request: Request, env: Env): Promise<Response> {
+export async function handleConversation(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
   const body = await request.json() as {
     callId: string;
     from: string;
@@ -112,11 +152,60 @@ export async function handleConversation(request: Request, env: Env): Promise<Re
     });
   }
 
-  // Call app's onSpeech handler
+  // V2: streaming path — first sentence TTS'd immediately, rest processed in background
+  if (env.TTS_MODE === 'direct' && ctx && app.streamSpeech) {
+    const origin = new URL(request.url).origin;
+    const callKey = `stream:${context.callId}`;
+
+    try {
+      const sentenceStream = app.streamSpeech(context, input);
+      const { value: sentence1, done: done1 } = await sentenceStream.next();
+
+      const safeSentence1 = sentence1 ? sanitizeForTTS(sentence1) : '';
+
+      if (safeSentence1) {
+        const s1Audio = await callElevenLabs(safeSentence1, env.ELEVENLABS_API_KEY);
+        const s1Id = crypto.randomUUID();
+        await env.RATE_LIMIT_KV.put(`tts:${s1Id}`, s1Audio, { expirationTtl: 120 });
+
+        const transcribeUtterance = {
+          TranscribeUtterance: {
+            actionUrl: `${origin}/conversation`,
+            playBeep: false,
+            record: { maxLengthSec: 25, rcrdTerminationSilenceTimeMs: 4000 },
+          },
+        };
+
+        if (done1) {
+          // Only one sentence — no redirect needed
+          return Response.json(
+            [{ Play: { file: `${origin}/tts-cache?id=${s1Id}` } }, transcribeUtterance],
+            { headers: { 'Content-Type': 'application/json' } },
+          );
+        }
+
+        // Multiple sentences: return s1 + redirect, process rest in background
+        await env.RATE_LIMIT_KV.put(`${callKey}:1`, s1Id, { expirationTtl: 120 });
+        ctx.waitUntil(processRemainingStream(sentenceStream, callKey, env, 1));
+
+        return Response.json(
+          [
+            { Play: { file: `${origin}/tts-cache?id=${s1Id}` } },
+            { Redirect: { actionUrl: `${origin}/continue?callId=${context.callId}&n=1` } },
+          ],
+          { headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+    } catch (streamErr) {
+      console.error('Streaming path error, falling back to non-streaming:', streamErr);
+    }
+  }
+
+  // Standard (non-streaming) path
   const response = await app.onSpeech(context, input);
 
   // Convert to PerCL
-  const percl = buildPerCL(response, request.url);
+  const percl = await buildPerCL(response, request.url, getTTSProvider(env));
 
   return Response.json(percl, {
     headers: { 'Content-Type': 'application/json' },

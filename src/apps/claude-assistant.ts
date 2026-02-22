@@ -45,6 +45,23 @@ interface Message {
   content: string | ContentBlock[];
 }
 
+/**
+ * Extract complete sentences from a text buffer.
+ * A sentence ends at . ! ? followed by whitespace (or end of string for the remainder).
+ */
+function extractCompleteSentences(buffer: string): { complete: string[]; remainder: string } {
+  const sentences: string[] = [];
+  const re = /[.!?][\s]+/g;
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(buffer)) !== null) {
+    const sentence = buffer.slice(last, match.index + 1).trim();
+    if (sentence) sentences.push(sentence);
+    last = match.index + match[0].length;
+  }
+  return { complete: sentences, remainder: buffer.slice(last) };
+}
+
 // Simple in-memory conversation storage with TTL
 const CONVERSATION_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const conversations = new Map<string, { messages: Message[]; lastActive: number }>();
@@ -126,6 +143,214 @@ export class ClaudeAssistant implements VoxnosApp {
       callId: context.callId,
       timestamp: new Date().toISOString(),
     }));
+  }
+
+  /**
+   * V2 streaming path: yields one sentence at a time as Claude generates the response.
+   * Uses the Anthropic streaming API for the final text answer; tool calls remain non-streaming.
+   * Sentences are yielded immediately upon detection of a sentence boundary, enabling
+   * routes.ts to TTS sentence 1 and return to FreeClimb before sentences 2+ are ready.
+   */
+  async *streamSpeech(context: AppContext, input: SpeechInput): AsyncGenerator<string, void, undefined> {
+    const userMessage = input.text.trim();
+
+    if (this.isGoodbye(userMessage)) {
+      yield 'Goodbye! Have a great day.';
+      return;
+    }
+
+    const entry = conversations.get(context.callId);
+    const messages: Message[] = entry ? [...entry.messages] : [];
+    messages.push({ role: 'user', content: userMessage });
+
+    yield* this.streamClaude(context, messages);
+
+    conversations.set(context.callId, { messages, lastActive: Date.now() });
+  }
+
+  /**
+   * Core streaming Claude call with tool-use support.
+   * Streams the Anthropic API response, yielding sentences as they arrive.
+   * If tool_use blocks are detected, executes tools (non-streamingly) and loops.
+   */
+  private async *streamClaude(context: AppContext, messages: Message[]): AsyncGenerator<string, void, undefined> {
+    const systemPrompt = `You are a helpful voice assistant. Your responses will be converted to speech, so:
+- Keep responses concise (2-3 sentences max)
+- Use natural, conversational language
+- Avoid special characters, URLs, or formatting
+- If asked complex questions, summarize briefly and offer to elaborate
+- Be friendly and helpful
+- When using tools, explain what you found in a natural way`;
+
+    let totalInputTokens = 0;
+    let totalOutputTokens = 0;
+    let apiCalls = 0;
+
+    while (true) {
+      const response = await fetchWithRetry('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': context.env.ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-5-20250929',
+          max_tokens: 300,
+          system: systemPrompt,
+          messages,
+          tools: toolRegistry.getDefinitions(),
+          stream: true,
+        }),
+      });
+
+      if (!response.ok) {
+        console.error(JSON.stringify({ event: 'claude_stream_error', callId: context.callId, status: response.status, timestamp: new Date().toISOString() }));
+        yield "I'm sorry, I'm having trouble processing that right now. Could you try again?";
+        return;
+      }
+
+      // Parse the SSE stream
+      const reader = response.body!.getReader();
+      const decoder = new TextDecoder();
+      let sseBuffer = '';
+      let sentenceBuffer = '';
+      let hasToolUse = false;
+      const toolUseBlocks: Array<{ id: string; name: string; input: Record<string, any> }> = [];
+      let currentToolId = '';
+      let currentToolName = '';
+      let currentToolInputJson = '';
+      const yieldedSentences: string[] = [];
+      let inputTokens = 0;
+      let outputTokens = 0;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        sseBuffer += decoder.decode(value, { stream: true });
+
+        // Process complete SSE events (separated by \n\n)
+        let boundary: number;
+        while ((boundary = sseBuffer.indexOf('\n\n')) !== -1) {
+          const eventText = sseBuffer.slice(0, boundary);
+          sseBuffer = sseBuffer.slice(boundary + 2);
+
+          if (!eventText.trim()) continue;
+
+          let eventData = '';
+          for (const line of eventText.split('\n')) {
+            if (line.startsWith('data: ')) {
+              eventData = line.slice(6);
+              break;
+            }
+          }
+
+          if (!eventData || eventData === '[DONE]') continue;
+
+          let event: any;
+          try { event = JSON.parse(eventData); } catch { continue; }
+
+          switch (event.type) {
+            case 'message_start':
+              inputTokens = event.message?.usage?.input_tokens ?? 0;
+              break;
+
+            case 'content_block_start':
+              if (event.content_block?.type === 'tool_use') {
+                hasToolUse = true;
+                currentToolId = event.content_block.id ?? '';
+                currentToolName = event.content_block.name ?? '';
+                currentToolInputJson = '';
+              }
+              break;
+
+            case 'content_block_delta':
+              if (event.delta?.type === 'text_delta' && !hasToolUse) {
+                sentenceBuffer += event.delta.text ?? '';
+                const { complete, remainder } = extractCompleteSentences(sentenceBuffer);
+                for (const sentence of complete) {
+                  if (sentence.trim()) {
+                    yield sentence.trim();
+                    yieldedSentences.push(sentence.trim());
+                  }
+                }
+                sentenceBuffer = remainder;
+              } else if (event.delta?.type === 'input_json_delta') {
+                currentToolInputJson += event.delta.partial_json ?? '';
+              }
+              break;
+
+            case 'content_block_stop':
+              if (hasToolUse && currentToolId) {
+                let input: Record<string, any> = {};
+                try { input = JSON.parse(currentToolInputJson || '{}'); } catch { /* empty input */ }
+                toolUseBlocks.push({ id: currentToolId, name: currentToolName, input });
+                currentToolId = '';
+                currentToolName = '';
+                currentToolInputJson = '';
+              }
+              break;
+
+            case 'message_delta':
+              outputTokens = event.usage?.output_tokens ?? 0;
+              break;
+          }
+        }
+      }
+
+      apiCalls++;
+      totalInputTokens += inputTokens;
+      totalOutputTokens += outputTokens;
+
+      if (hasToolUse) {
+        // Build assistant content (optional leading text + tool_use blocks)
+        const assistantContent: ContentBlock[] = [
+          ...(yieldedSentences.length > 0 ? [{ type: 'text' as const, text: yieldedSentences.join(' ') }] : []),
+          ...toolUseBlocks.map(t => ({
+            type: 'tool_use' as const,
+            id: t.id,
+            name: t.name,
+            input: t.input,
+          })),
+        ];
+
+        const toolResults: ContentBlock[] = [];
+        for (const tool of toolUseBlocks) {
+          console.log(JSON.stringify({ event: 'tool_execute', callId: context.callId, tool: tool.name, timestamp: new Date().toISOString() }));
+          const result = await toolRegistry.execute(tool.name, tool.input);
+          toolResults.push({ type: 'tool_result', tool_use_id: tool.id, content: result });
+        }
+
+        messages.push({ role: 'assistant', content: assistantContent });
+        messages.push({ role: 'user', content: toolResults });
+        // Loop for the final text answer
+      } else {
+        // Pure text response — yield any remaining buffer content
+        if (sentenceBuffer.trim()) {
+          yield sentenceBuffer.trim();
+          yieldedSentences.push(sentenceBuffer.trim());
+        }
+
+        const fullText = yieldedSentences.join(' ');
+        if (fullText) {
+          messages.push({ role: 'assistant', content: fullText });
+        }
+
+        console.log(JSON.stringify({
+          event: 'claude_stream_complete',
+          callId: context.callId,
+          api_calls: apiCalls,
+          input_tokens: totalInputTokens,
+          output_tokens: totalOutputTokens,
+          sentences: yieldedSentences.length,
+          timestamp: new Date().toISOString(),
+        }));
+
+        this.trackDailyCost(context.env.RATE_LIMIT_KV, totalInputTokens, totalOutputTokens).catch(() => {});
+        break;
+      }
+    }
   }
 
   private async callClaude(context: AppContext, history: Message[]): Promise<string> {

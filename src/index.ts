@@ -23,6 +23,7 @@ import {
   handleGetLogs,
   handleUpdateApplication,
 } from './routes.js';
+import { callElevenLabs, computeTtsSignature } from './tts/index.js';
 
 // Register tools
 toolRegistry.register(new WeatherTool());
@@ -33,7 +34,7 @@ registry.register(new EchoApp());                // Simple echo demo
 registry.register(new ClaudeAssistant(), true);  // Default: Claude-powered assistant
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     // Validate environment configuration
     const envValidation = validateEnv(env);
     if (!envValidation.valid) {
@@ -90,7 +91,7 @@ export default {
         body: JSON.stringify(body),
       });
 
-      return handleConversation(newRequest, env);
+      return handleConversation(newRequest, env, ctx);
     }
 
     // Health check
@@ -213,6 +214,90 @@ export default {
         days.push({ date, input_tokens: val?.input_tokens ?? 0, output_tokens: val?.output_tokens ?? 0, requests: val?.requests ?? 0 });
       }
       return Response.json({ service: 'voxnos', days });
+    }
+
+    // Direct ElevenLabs TTS endpoint — called by FreeClimb Play command (TTS_MODE=direct)
+    // URL is HMAC-signed by our Worker; random callers cannot forge a valid signature
+    if (url.pathname === '/tts' && request.method === 'GET') {
+      const text = url.searchParams.get('text');
+      const voiceId = url.searchParams.get('voice');
+      const sig = url.searchParams.get('sig');
+
+      if (!text || !sig) {
+        return new Response('Bad request', { status: 400 });
+      }
+
+      const decodedText = decodeURIComponent(text);
+      const expectedSig = await computeTtsSignature(decodedText, env.TTS_SIGNING_SECRET);
+
+      if (sig !== expectedSig) {
+        return new Response('Unauthorized', { status: 401 });
+      }
+
+      try {
+        const audioBuffer = await callElevenLabs(decodedText, env.ELEVENLABS_API_KEY, voiceId ?? undefined);
+        return new Response(audioBuffer, {
+          headers: { 'Content-Type': 'audio/mpeg' },
+        });
+      } catch (err) {
+        console.error('ElevenLabs TTS error:', err);
+        return new Response('TTS generation failed', { status: 502 });
+      }
+    }
+
+    // Pre-generated TTS audio cache — served by UUID (V2 streaming path)
+    // UUID is unguessable (128-bit random), no additional signing needed
+    if (url.pathname === '/tts-cache' && request.method === 'GET') {
+      const id = url.searchParams.get('id');
+      if (!id) return new Response('Bad request', { status: 400 });
+
+      const audio = await env.RATE_LIMIT_KV.get(`tts:${id}`, 'arrayBuffer');
+      if (!audio) return new Response('Not found', { status: 404 });
+
+      return new Response(audio, {
+        headers: { 'Content-Type': 'audio/mpeg' },
+      });
+    }
+
+    // V2 redirect chain — called by FreeClimb after playing sentence N, retrieves sentence N+1
+    // callId is a FreeClimb-generated ID; unguessable in practice
+    if (url.pathname === '/continue' && request.method === 'GET') {
+      const callId = url.searchParams.get('callId');
+      const n = parseInt(url.searchParams.get('n') ?? '0', 10);
+
+      if (!callId) return new Response('Bad request', { status: 400 });
+
+      const callKey = `stream:${callId}`;
+      const nextN = n + 1;
+      const origin = new URL(request.url).origin;
+
+      // Poll up to 4 attempts (0ms, 200ms, 400ms, 600ms) for background TTS to finish
+      let nextId: string | null = null;
+      for (let attempt = 0; attempt < 4; attempt++) {
+        if (attempt > 0) await new Promise(r => setTimeout(r, 200));
+        nextId = await env.RATE_LIMIT_KV.get(`${callKey}:${nextN}`);
+        if (nextId) break;
+        const done = await env.RATE_LIMIT_KV.get(`${callKey}:done`);
+        if (done) break;
+      }
+
+      const transcribeUtterance = {
+        TranscribeUtterance: {
+          actionUrl: `${origin}/conversation`,
+          playBeep: false,
+          record: { maxLengthSec: 25, rcrdTerminationSilenceTimeMs: 4000 },
+        },
+      };
+
+      if (!nextId) {
+        // No more sentences — prompt caller for next input
+        return Response.json([transcribeUtterance]);
+      }
+
+      return Response.json([
+        { Play: { file: `${origin}/tts-cache?id=${nextId}` } },
+        { Redirect: { actionUrl: `${origin}/continue?callId=${callId}&n=${nextN}` } },
+      ]);
     }
 
     return new Response('Not Found', { status: 404 });
