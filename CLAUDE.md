@@ -1,52 +1,10 @@
 # jc-voxnos
 
-Multi-app voice platform for building speech-enabled applications using FreeClimb telephony. Handles inbound phone calls, routes to registered apps, orchestrates Claude AI + tools, and delivers speech via Google Chirp 3 HD TTS.
+Multi-app voice platform: FreeClimb telephony + Claude Sonnet 4.6 + Google Chirp 3 HD TTS.
 
-## Architecture
+**Call flow**: `/call` → App Router → `app.onStart()` greeting. `/conversation` → `app.onSpeech()` → Claude + tools → `streamSpeech()` → KV → Play commands.
 
-```
-Incoming Call → FreeClimb → POST /call (webhook-auth)
-                                  ↓
-                             App Router (registry)
-                                  ↓
-                          app.onStart() → PerCL response
-                                  ↓
-Caller speaks → FreeClimb → POST /conversation (webhook-auth)
-                                  ↓
-                          app.onSpeech() → Claude + tools
-                                  ↓
-                    streamSpeech() → sentences → KV → Play commands
-```
-
-## File Structure
-
-```
-src/
-├── index.ts              # Entry point, routing, /tts /tts-cache /continue endpoints
-├── routes.ts             # handleConversation, V2 streaming orchestration
-├── core/
-│   ├── types.ts          # VoxnosApp, AppContext, SpeechInput, AppResponse, StreamChunk, Env
-│   ├── registry.ts       # App registration and routing
-│   ├── auth.ts           # Admin API key auth
-│   ├── webhook-auth.ts   # FreeClimb webhook signature validation
-│   ├── rate-limit.ts     # KV-backed rate limiting
-│   └── env.ts            # Env validation (mode-conditional TTS key checks)
-├── apps/
-│   ├── claude-assistant.ts  # Default: Claude Sonnet + tools + streamSpeech generator
-│   └── echo.ts              # Demo: repeats input
-├── tools/
-│   ├── types.ts / registry.ts / validation.ts
-│   ├── weather.ts        # Open-Meteo API
-│   └── cognos.ts         # Cognos /brief integration
-├── percl/
-│   └── builder.ts        # Async PerCL builder (Say/Play/Hangup/Pause)
-└── tts/
-    ├── types.ts           # TTSProvider interface (getEngineConfig, optional getPlayUrl)
-    ├── elevenlabs.ts      # callElevenLabs(), computeTtsSignature(), ELEVENLABS_VOICE_ID
-    ├── freeclimb.ts       # DirectElevenLabsProvider + legacy providers
-    ├── google.ts          # callGoogleTTS(), GOOGLE_TTS_VOICE (en-US-Chirp3-HD-Despina)
-    └── index.ts           # Provider selection, exports
-```
+**Source**: `src/index.ts` (routing, /tts /tts-cache /continue), `src/routes.ts` (handleConversation, streaming V2), `src/apps/claude-assistant.ts` (default app), `src/tools/` (weather, cognos), `src/tts/` (google, elevenlabs, freeclimb providers), `src/percl/builder.ts`, `src/core/` (types, registry, auth, webhook-auth, rate-limit, env).
 
 ## Registered Apps
 
@@ -60,73 +18,42 @@ src/
 - `POST /conversation` — each speech turn, returns PerCL response
 
 ### TTS (public, HMAC-signed URLs)
-- `GET /tts` — on-demand TTS: `?text=...&voice=...&sig=...` — validates HMAC, calls Google/ElevenLabs, returns audio
-- `GET /tts-cache` — KV-backed audio: `?id=...` — serves pre-generated audio, `Cache-Control: no-store`
-- `GET /continue` — streaming redirect chain: polls KV for next sentence (15×500ms), returns Play+Redirect or TranscribeUtterance
+- `GET /tts` — on-demand: `?text=...&sig=...` — validates HMAC, calls Google/ElevenLabs, returns audio
+- `GET /tts-cache` — KV-backed: `?id=...` — serves pre-generated audio, `Cache-Control: no-store`
+- `GET /continue` — streaming chain: polls KV for next sentence (15×500ms), returns Play+Redirect or TranscribeUtterance
 
 ### Admin (Bearer: ADMIN_API_KEY)
 - `GET /debug/account`, `GET /phone-numbers`, `POST /setup`, `POST /update-number`, `POST /update-app`
-- `GET /logs` — FreeClimb call logs (`?limit=N`)
-- `GET /costs` — 14-day Anthropic token usage
+- `GET /logs` — FreeClimb call logs, `GET /costs` — 14-day Anthropic token usage
 
-### Public (no auth)
-- `GET /` — health check
-- `GET /apps` — list registered apps
+### Public
+- `GET /` — health check, `GET /apps` — list registered apps
 
 ## TTS Configuration
 
-**Active mode**: `TTS_MODE=google` (wrangler.toml var)
-**Active voice**: `en-US-Chirp3-HD-Despina` (Google Chirp 3 HD)
-**Audio format**: LINEAR16 WAV at 8kHz (FreeClimb compatible)
-
-Modes: `google` (active) | `11labs` (direct ElevenLabs) | `freeclimb` (FreeClimb built-in)
-
-**Fallback**: if external TTS (google/11labs) fails, routes fall through to FreeClimb built-in Say command automatically.
-
-**Cache key rule**: All stable TTS keys (filler, goodbye, retry, greeting) append `VOICE_SLUG` — changing voice automatically busts FreeClimb's HTTP cache. All `/tts-cache` responses include `Cache-Control: no-store` to prevent FreeClimb caching at the HTTP layer.
+**Active**: `TTS_MODE=google` → `en-US-Chirp3-HD-Despina` (Chirp 3 HD), LINEAR16 WAV 8kHz
+**Modes**: `google` (active) | `11labs` (direct ElevenLabs) | `freeclimb` (built-in, always fallback)
+**Fallback**: google/11labs failure → FreeClimb built-in Say automatically
+**Cache key rule**: stable keys append `VOICE_SLUG`; `/tts-cache` always `Cache-Control: no-store`
 
 ## Streaming Flow (TTS_MODE=google|11labs)
 
-1. `streamSpeech()` yields `StreamChunk` sentences from Claude's streaming response
-2. First sentence: pre-generated immediately, stored in KV, returned as `Play` + `Redirect` to `/continue`
-3. Remaining sentences: background-processed via `ctx.waitUntil()`, stored in KV with per-turn UUID
-4. `/continue` polls KV (15×500ms, ~7.5s max) for next sentence; returns `Play+Redirect` or `TranscribeUtterance` when done
+1. `streamSpeech()` yields sentences from Claude's streaming response
+2. First sentence: TTS'd immediately → KV → `Play` + `Redirect` to `/continue`
+3. Remaining: background via `ctx.waitUntil()`, stored in KV with per-turn UUID
+4. `/continue` polls KV (15×500ms, ~7.5s max) → `Play+Redirect` or `TranscribeUtterance`
 
-## Conversation History
+## KV Schema (RATE_LIMIT_KV)
 
-Stored in KV (`conv:{callId}`, 15-min TTL) — survives Worker isolate routing across turns within a call.
-
-## Rate Limiting
-
-- `/call`: by IP
-- `/conversation`: by callId
-- Admin endpoints: by API key prefix
-
-## Authentication
-
-- Webhooks: FreeClimb signature header (`FREECLIMB_SIGNING_SECRET`)
-- Admin: Bearer token (`ADMIN_API_KEY`)
-- TTS URLs: HMAC-SHA256 signature (`TTS_SIGNING_SECRET`)
-
-## Environment
-
-**Cloudflare Secrets:**
-```
-FREECLIMB_ACCOUNT_ID, FREECLIMB_API_KEY, FREECLIMB_SIGNING_SECRET
-ANTHROPIC_API_KEY
-ADMIN_API_KEY
-TTS_SIGNING_SECRET
-COGNOS_PUBLIC_KEY
-GOOGLE_TTS_API_KEY    # required when TTS_MODE=google
-ELEVENLABS_API_KEY    # required when TTS_MODE=11labs
-```
-
-**Vars (wrangler.toml):**
-```
-TTS_MODE = "google"
-```
-
-**KV:** `RATE_LIMIT_KV` (id: `58a6ac9954ea44d2972ba2cb9e1e077e`) — rate limiting + TTS cache + conversation history
+| Key pattern | Value | TTL | Purpose |
+|---|---|---|---|
+| `tts:{stable-key}-{VOICE_SLUG}` | audio ArrayBuffer | 6hr | greetings, fillers, retry phrases |
+| `tts:{uuid}` | audio ArrayBuffer | 120s | per-sentence streaming audio |
+| `stream:{callId}:{turnId}:{n}` | UUID string | 120s | sentence index pointer |
+| `stream:{callId}:{turnId}:done` | `'1'` | 120s | stream completion signal |
+| `conv:{callId}` | JSON messages | 15min | conversation history |
+| `rl:{prefix}:{id}:{bucket}` | count string | 120s | rate limiting |
+| `costs:voxnos:{date}` | JSON token counts | 90d | cost tracking |
 
 ## Invariants
 
@@ -145,20 +72,25 @@ Calls `POST https://jc-cognos.cloudflare-5cf.workers.dev/brief` via the `cognos`
 - Response: `answer` field (speakable text, no URLs/citations)
 - **Stability rule**: if cognos changes this contract, update this section.
 
+## Environment
+
+**Cloudflare Secrets:**
+```
+FREECLIMB_ACCOUNT_ID, FREECLIMB_API_KEY, FREECLIMB_SIGNING_SECRET
+ANTHROPIC_API_KEY, ADMIN_API_KEY, TTS_SIGNING_SECRET, COGNOS_PUBLIC_KEY
+GOOGLE_TTS_API_KEY    # required when TTS_MODE=google
+ELEVENLABS_API_KEY    # required when TTS_MODE=11labs
+```
+**Vars (wrangler.toml):** `TTS_MODE = "google"`
+**KV:** `RATE_LIMIT_KV` (id: `58a6ac9954ea44d2972ba2cb9e1e077e`)
+
 ## Ava Platform Context
 
-This is the **voice node** of the Ava platform.
-
-- **Upstream dependency**: `jc-cognos` — provides knowledge via `POST /brief`
-- **Telephony layer**: FreeClimb (call routing, transcription, audio playback)
-- Global constraints: Cloudflare free tier, KV 1k writes/day — TTS cache uses ~1 write per sentence; see `platform/CLAUDE.md`
-- Full topology: `platform/mesh/AVA-MAP.md`
+Voice node of the Ava platform. Upstream: `jc-cognos` via `POST /brief`. Telephony: FreeClimb. Global constraints: Cloudflare free tier, KV ~30 writes/5-turn call. Full topology: `../platform/mesh/AVA-MAP.md`.
 
 ## Deployment
 
-CI/CD: GitHub Actions auto-deploys on push to `master` (`.github/workflows/deploy.yml`).
-Manual: `npx wrangler deploy`
-Dev: `npm run dev` + `cloudflared tunnel --url http://localhost:8787`
+CI/CD: GitHub Actions on push to `master`. Manual: `npx wrangler deploy`. Dev: `npm run dev` + `cloudflared tunnel --url http://localhost:8787`.
 
 ## Adding a New App
 
@@ -167,8 +99,4 @@ Dev: `npm run dev` + `cloudflared tunnel --url http://localhost:8787`
 
 ## Mesh Protocol
 
-When you change code or config that affects behavior or wiring, update this file (`CLAUDE.md`) before finishing.
-
-Produce a **Docs Sync Summary**: files changed, what was affected, any downstream impact.
-
-Never include secret values in docs. Full protocol: `platform/mesh/DOCS-SYNC.md`.
+Update `CLAUDE.md` when behavior or wiring changes. Produce a **Docs Sync Summary**: files changed, what was affected, downstream impact. No secret values. Full protocol: `../platform/mesh/DOCS-SYNC.md`.
