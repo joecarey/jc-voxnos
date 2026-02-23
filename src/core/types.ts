@@ -1,19 +1,18 @@
 // Core types for voxnos platform
 
 export interface Env {
-  SUPABASE_URL: string;
-  SUPABASE_SERVICE_ROLE_KEY: string;
   FREECLIMB_ACCOUNT_ID: string;
   FREECLIMB_API_KEY: string;
   FREECLIMB_SIGNING_SECRET: string;
   ANTHROPIC_API_KEY: string;
   ADMIN_API_KEY: string;
   RATE_LIMIT_KV: KVNamespace;
-  ELEVENLABS_API_KEY: string;
+  ELEVENLABS_API_KEY?: string;  // required when TTS_MODE=11labs
   ELEVENLABS_BASE_URL?: string;  // optional: override ElevenLabs API base (e.g. Cloudflare AI Gateway)
   TTS_SIGNING_SECRET: string;
   GOOGLE_TTS_API_KEY?: string;  // required when TTS_MODE=google
   TTS_MODE?: string;  // 'freeclimb' (default) | '11labs' | 'google'
+  COGNOS_PUBLIC_KEY: string;
 }
 
 export interface AppContext {
@@ -21,7 +20,6 @@ export interface AppContext {
   callId: string;
   from: string;
   to: string;
-  sessionId?: string;
 }
 
 export interface SpeechInput {

@@ -30,8 +30,7 @@ src/
 │   ├── auth.ts           # Admin API key auth
 │   ├── webhook-auth.ts   # FreeClimb webhook signature validation
 │   ├── rate-limit.ts     # KV-backed rate limiting
-│   ├── validation.ts     # Input validation
-│   └── env.ts            # Env validation
+│   └── env.ts            # Env validation (mode-conditional TTS key checks)
 ├── apps/
 │   ├── claude-assistant.ts  # Default: Claude Sonnet + tools + streamSpeech generator
 │   └── echo.ts              # Demo: repeats input
@@ -52,7 +51,7 @@ src/
 ## Registered Apps
 
 - `EchoApp` — demo only
-- `ClaudeAssistant` — **default** — Claude Sonnet, tools (weather + cognos), streaming TTS, KV conversation history
+- `ClaudeAssistant` — **default** — Claude Sonnet 4.6 (`claude-sonnet-4-6`), tools (weather + cognos), streaming TTS, KV conversation history
 
 ## HTTP Endpoints
 
@@ -80,7 +79,9 @@ src/
 **Active voice**: `en-US-Chirp3-HD-Despina` (Google Chirp 3 HD)
 **Audio format**: LINEAR16 WAV at 8kHz (FreeClimb compatible)
 
-Modes: `google` (active) | `11labs` (direct ElevenLabs) | `freeclimb` (legacy)
+Modes: `google` (active) | `11labs` (direct ElevenLabs) | `freeclimb` (FreeClimb built-in)
+
+**Fallback**: if external TTS (google/11labs) fails, routes fall through to FreeClimb built-in Say command automatically.
 
 **Cache key rule**: All stable TTS keys (filler, goodbye, retry, greeting) append `VOICE_SLUG` — changing voice automatically busts FreeClimb's HTTP cache. All `/tts-cache` responses include `Cache-Control: no-store` to prevent FreeClimb caching at the HTTP layer.
 
@@ -111,13 +112,13 @@ Stored in KV (`conv:{callId}`, 15-min TTL) — survives Worker isolate routing a
 
 **Cloudflare Secrets:**
 ```
-SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
 FREECLIMB_ACCOUNT_ID, FREECLIMB_API_KEY, FREECLIMB_SIGNING_SECRET
 ANTHROPIC_API_KEY
 ADMIN_API_KEY
-ELEVENLABS_API_KEY
 TTS_SIGNING_SECRET
 COGNOS_PUBLIC_KEY
+GOOGLE_TTS_API_KEY    # required when TTS_MODE=google
+ELEVENLABS_API_KEY    # required when TTS_MODE=11labs
 ```
 
 **Vars (wrangler.toml):**

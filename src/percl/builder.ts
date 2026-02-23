@@ -60,12 +60,10 @@ const DEFAULT_TTS_PROVIDER = new ElevenLabsProvider({
  * Convert app response to FreeClimb PerCL commands.
  *
  * TTS mode selection:
- * - If ttsProvider.getPlayUrl exists (DirectElevenLabsProvider): emits Play command
- *   pointing to /tts endpoint — direct ElevenLabs billing, HMAC-signed URL.
- * - Otherwise: emits Say command with optional engine config — FreeClimb-mediated TTS.
- *
- * If response.audioUrls is set (V2 streaming pre-generation), those Play commands
- * are used directly and no TTS provider is invoked.
+ * - If response.audioUrls is set (google|11labs streaming path): Play commands used directly.
+ * - If ttsProvider.getPlayUrl exists (DirectElevenLabsProvider, TTS_MODE=11labs): emits Play
+ *   command pointing to /tts endpoint — HMAC-signed URL.
+ * - Otherwise: emits Say command with optional engine config — FreeClimb-mediated TTS (fallback).
  *
  * @param response - App response from onStart or onSpeech handler
  * @param baseUrl - Base URL for webhook callbacks
@@ -89,7 +87,7 @@ export async function buildPerCL(
     const safeText = sanitizeForTTS(response.speech.text);
     if (safeText) {
       if (ttsProvider.getPlayUrl) {
-        // Direct ElevenLabs path (TTS_MODE=direct): HMAC-signed Play URL
+        // Direct path (TTS_MODE=11labs): HMAC-signed Play URL via /tts endpoint
         const playUrl = await ttsProvider.getPlayUrl(safeText, origin);
         if (playUrl) {
           percl.push({ Play: { file: playUrl } });

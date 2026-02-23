@@ -62,6 +62,18 @@ function extractCompleteSentences(buffer: string): { complete: string[]; remaind
   return { complete: sentences, remainder: buffer.slice(last) };
 }
 
+const CLAUDE_MODEL = 'claude-sonnet-4-6';
+
+const SYSTEM_PROMPT = `You are a helpful voice assistant. Your responses will be converted to speech, so:
+- Keep responses concise (1-2 sentences for simple answers, 3 max for complex ones)
+- Use natural, conversational language
+- Avoid special characters, URLs, or formatting
+- If asked complex questions, summarize briefly and offer to elaborate
+- Be friendly and helpful
+- When using tools, state the result once clearly — do not restate or paraphrase the same fact
+- Never repeat information you already said in a different form
+- Always use tools to fetch real-time data (weather, stocks, etc.) — even for follow-up questions about different locations or topics; never answer from training data when a tool is available`;
+
 // Phrases used for tool-call acknowledgments — randomized so repeat callers don't hear the same line
 export const FILLER_PHRASES = [
   'One moment while I check on that.',
@@ -190,15 +202,6 @@ export class ClaudeAssistant implements VoxnosApp {
    * If tool_use blocks are detected, executes tools (non-streamingly) and loops.
    */
   private async *streamClaude(context: AppContext, messages: Message[]): AsyncGenerator<string, void, undefined> {
-    const systemPrompt = `You are a helpful voice assistant. Your responses will be converted to speech, so:
-- Keep responses concise (1-2 sentences for simple answers, 3 max for complex ones)
-- Use natural, conversational language
-- Avoid special characters, URLs, or formatting
-- If asked complex questions, summarize briefly and offer to elaborate
-- Be friendly and helpful
-- When using tools, state the result once clearly — do not restate or paraphrase the same fact
-- Never repeat information you already said in a different form
-- Always use tools to fetch real-time data (weather, stocks, etc.) — even for follow-up questions about different locations or topics; never answer from training data when a tool is available`;
 
     let totalInputTokens = 0;
     let totalOutputTokens = 0;
@@ -213,9 +216,9 @@ export class ClaudeAssistant implements VoxnosApp {
           'anthropic-version': '2023-06-01',
         },
         body: JSON.stringify({
-          model: 'claude-sonnet-4-5-20250929',
+          model: CLAUDE_MODEL,
           max_tokens: 300,
-          system: systemPrompt,
+          system: SYSTEM_PROMPT,
           messages,
           tools: toolRegistry.getDefinitions(),
           stream: true,
@@ -380,15 +383,6 @@ export class ClaudeAssistant implements VoxnosApp {
   }
 
   private async callClaude(context: AppContext, history: Message[]): Promise<string> {
-    const systemPrompt = `You are a helpful voice assistant. Your responses will be converted to speech, so:
-- Keep responses concise (1-2 sentences for simple answers, 3 max for complex ones)
-- Use natural, conversational language
-- Avoid special characters, URLs, or formatting
-- If asked complex questions, summarize briefly and offer to elaborate
-- Be friendly and helpful
-- When using tools, state the result once clearly — do not restate or paraphrase the same fact
-- Never repeat information you already said in a different form
-- Always use tools to fetch real-time data (weather, stocks, etc.) — even for follow-up questions about different locations or topics; never answer from training data when a tool is available`;
 
     try {
       let continueLoop = true;
@@ -407,9 +401,9 @@ export class ClaudeAssistant implements VoxnosApp {
             'anthropic-version': '2023-06-01',
           },
           body: JSON.stringify({
-            model: 'claude-sonnet-4-5-20250929',
+            model: CLAUDE_MODEL,
             max_tokens: 300,
-            system: systemPrompt,
+            system: SYSTEM_PROMPT,
             messages: history,
             tools: toolRegistry.getDefinitions(),
           }),

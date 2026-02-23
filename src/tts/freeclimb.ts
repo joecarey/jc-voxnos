@@ -31,32 +31,6 @@ export class ElevenLabsProvider implements TTSProvider {
 }
 
 /**
- * AWS Polly TTS provider for FreeClimb
- * Uses AWS Polly voices through FreeClimb's Say command
- */
-export class AWSPollyProvider implements TTSProvider {
-  readonly name = 'AWSPolly';
-  private voiceConfig: VoiceConfig;
-
-  constructor(voiceConfig?: Partial<VoiceConfig>) {
-    this.voiceConfig = {
-      voiceId: voiceConfig?.voiceId ?? 'Joanna',  // Default AWS Polly voice
-      languageCode: voiceConfig?.languageCode ?? 'en-US',
-    };
-  }
-
-  getEngineConfig(_text: string): TTSEngineConfig {
-    return {
-      name: this.name,
-      parameters: {
-        voice_id: this.voiceConfig.voiceId,
-        language_code: this.voiceConfig.languageCode ?? 'en-US',
-      },
-    };
-  }
-}
-
-/**
  * Default FreeClimb TTS provider (uses FreeClimb's built-in voices)
  * No custom engine - falls back to FreeClimb default
  */

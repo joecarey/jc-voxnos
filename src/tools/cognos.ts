@@ -3,6 +3,12 @@
 import type { Tool, ToolDefinition } from './types.js';
 
 export class CognosTool implements Tool {
+  private readonly apiKey: string;
+
+  constructor(apiKey: string) {
+    this.apiKey = apiKey;
+  }
+
   definition: ToolDefinition = {
     name: 'get_industry_brief',
     description: 'Get a concise industry briefing on contact centers, CX, AI, communications, or specific vendors. Returns high-signal updates on company moves, product launches, and key developments.',
@@ -27,7 +33,7 @@ export class CognosTool implements Tool {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': 'Bearer XkWHzrJZ3g9RwX/BixO6z2XW4xyZxTvIEo7FInRU774=',  // PUBLIC_API_KEY
+          'Authorization': `Bearer ${this.apiKey}`,
         },
         body: JSON.stringify({
           q: topic,

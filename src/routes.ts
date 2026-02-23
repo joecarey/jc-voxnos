@@ -3,7 +3,7 @@
 import { registry } from './core/registry.js';
 import type { Env, AppContext, SpeechInput, StreamChunk } from './core/types.js';
 import { buildPerCL, sanitizeForTTS } from './percl/builder.js';
-import { ElevenLabsProvider, DirectElevenLabsProvider, FreeClimbDefaultProvider, ELEVENLABS_VOICE_ID, callElevenLabs, callGoogleTTS, GOOGLE_TTS_VOICE } from './tts/index.js';
+import { DirectElevenLabsProvider, FreeClimbDefaultProvider, ELEVENLABS_VOICE_ID, callElevenLabs, callGoogleTTS, GOOGLE_TTS_VOICE } from './tts/index.js';
 
 // Short voice identifier appended to all stable TTS cache keys.
 // When the voice changes, URLs change and FreeClimb's HTTP cache is automatically busted.
@@ -32,6 +32,13 @@ function greetingCacheKey(text: string): string {
   return 'greeting-' + lower.replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40) + `-${VOICE_SLUG}`;
 }
 
+function freeclimbAuth(env: Env): { auth: string; apiBase: string } {
+  return {
+    auth: btoa(`${env.FREECLIMB_ACCOUNT_ID}:${env.FREECLIMB_API_KEY}`),
+    apiBase: 'https://www.freeclimb.com/apiserver',
+  };
+}
+
 function getTTSProvider(env: Env) {
   if (env.TTS_MODE === '11labs') {
     return new DirectElevenLabsProvider({
@@ -39,19 +46,16 @@ function getTTSProvider(env: Env) {
       signingSecret: env.TTS_SIGNING_SECRET,
     });
   }
-  if (env.TTS_MODE === 'google') {
-    // Google mode uses the streaming/Play path — FreeClimbDefaultProvider is the safe fallback
-    // for the non-streaming buildPerCL path (should not be reached when streamSpeech is active)
-    return new FreeClimbDefaultProvider();
-  }
-  return new ElevenLabsProvider({ voiceId: 'EXAVITQu4vr4xnSDxMaL', languageCode: 'en' });
+  // google and all other modes: FreeClimbDefaultProvider is the safe fallback
+  // for the non-streaming buildPerCL path (not reached when streamSpeech is active)
+  return new FreeClimbDefaultProvider();
 }
 
 function callTTS(text: string, env: Env): Promise<ArrayBuffer> {
   if (env.TTS_MODE === 'google') {
     return callGoogleTTS(text, env.GOOGLE_TTS_API_KEY!);
   }
-  return callElevenLabs(text, env.ELEVENLABS_API_KEY, undefined, env.ELEVENLABS_BASE_URL);
+  return callElevenLabs(text, env.ELEVENLABS_API_KEY!, undefined, env.ELEVENLABS_BASE_URL);
 }
 
 /**
@@ -92,23 +96,28 @@ export async function handleIncomingCall(request: Request, env: Env): Promise<Re
     // For direct TTS modes (google, 11labs), pre-generate greeting audio and use Play instead of Say.
     // Greetings are one of ~3 fixed strings (morning/afternoon/evening), so we cache them with a
     // stable KV key and a long TTL to avoid re-generating the same audio on every call.
+    // If TTS generation fails, falls through to buildPerCL which uses FreeClimb Say as fallback.
     if ((env.TTS_MODE === 'google' || env.TTS_MODE === '11labs') && response.speech?.text) {
       const safeText = sanitizeForTTS(response.speech.text);
       if (safeText) {
         const origin = new URL(request.url).origin;
         const greetingId = greetingCacheKey(safeText);
 
-        let audio = await env.RATE_LIMIT_KV.get(`tts:${greetingId}`, 'arrayBuffer');
-        if (audio) {
-          console.log(JSON.stringify({ event: 'greeting_cache_hit', key: greetingId, timestamp: new Date().toISOString() }));
-        } else {
-          audio = await callTTS(safeText, env);
-          // 6-hour TTL: covers voice/text updates while avoiding per-call TTS generation
-          await env.RATE_LIMIT_KV.put(`tts:${greetingId}`, audio, { expirationTtl: 6 * 60 * 60 });
-          console.log(JSON.stringify({ event: 'greeting_cache_miss', key: greetingId, timestamp: new Date().toISOString() }));
+        try {
+          let audio = await env.RATE_LIMIT_KV.get(`tts:${greetingId}`, 'arrayBuffer');
+          if (audio) {
+            console.log(JSON.stringify({ event: 'greeting_cache_hit', key: greetingId, timestamp: new Date().toISOString() }));
+          } else {
+            audio = await callTTS(safeText, env);
+            // 6-hour TTL: covers voice/text updates while avoiding per-call TTS generation
+            await env.RATE_LIMIT_KV.put(`tts:${greetingId}`, audio, { expirationTtl: 6 * 60 * 60 });
+            console.log(JSON.stringify({ event: 'greeting_cache_miss', key: greetingId, timestamp: new Date().toISOString() }));
+          }
+          response.audioUrls = [`${origin}/tts-cache?id=${greetingId}`];
+        } catch (ttsErr) {
+          console.error(JSON.stringify({ event: 'greeting_tts_fail', error: String(ttsErr), timestamp: new Date().toISOString() }));
+          // response.audioUrls stays unset — buildPerCL will emit Say via FreeClimb built-in
         }
-
-        response.audioUrls = [`${origin}/tts-cache?id=${greetingId}`];
       }
     }
 
@@ -160,18 +169,24 @@ async function processRemainingStream(
 /**
  * FreeClimb conversation webhook - handles each turn of dialogue
  */
-export async function handleConversation(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
+export async function handleConversation(
+  request: Request,
+  env: Env,
+  ctx?: ExecutionContext,
+  parsedBody?: Record<string, any>,
+): Promise<Response> {
+  type ConversationBody = {
+    callId: string;
+    from: string;
+    to: string;
+    recordingId?: string;
+    recordingUrl?: string;
+    transcript?: string;
+    transcribeReason?: string;
+    transcriptionDurationMs?: number;
+  };
   try {
-    const body = await request.json() as {
-      callId: string;
-      from: string;
-      to: string;
-      recordingId?: string;
-      recordingUrl?: string;
-      transcript?: string;
-      transcribeReason?: string;
-      transcriptionDurationMs?: number;
-    };
+    const body = (parsedBody as ConversationBody | undefined) ?? await request.json() as ConversationBody;
 
     console.log(JSON.stringify({ event: 'conversation_turn', callId: body.callId, transcript_length: body.transcript?.length ?? 0, transcribeReason: body.transcribeReason, timestamp: new Date().toISOString() }));
 
@@ -322,17 +337,14 @@ export function handleListApps(): Response {
  * Debug FreeClimb account endpoint
  */
 export async function handleDebugAccount(env: Env): Promise<Response> {
-  const accountId = env.FREECLIMB_ACCOUNT_ID;
-  const apiKey = env.FREECLIMB_API_KEY;
-  const auth = btoa(`${accountId}:${apiKey}`);
-  const apiBase = 'https://www.freeclimb.com/apiserver';
+  const { auth, apiBase } = freeclimbAuth(env);
 
   try {
     // Try different API paths
     const tests = [
-      { name: 'Account', url: `${apiBase}/Accounts/${accountId}` },
-      { name: 'IncomingPhoneNumbers (with account)', url: `${apiBase}/Accounts/${accountId}/IncomingPhoneNumbers` },
-      { name: 'Applications (with account)', url: `${apiBase}/Accounts/${accountId}/Applications` },
+      { name: 'Account', url: `${apiBase}/Accounts/${env.FREECLIMB_ACCOUNT_ID}` },
+      { name: 'IncomingPhoneNumbers (with account)', url: `${apiBase}/Accounts/${env.FREECLIMB_ACCOUNT_ID}/IncomingPhoneNumbers` },
+      { name: 'Applications (with account)', url: `${apiBase}/Accounts/${env.FREECLIMB_ACCOUNT_ID}/Applications` },
       { name: 'IncomingPhoneNumbers (no account)', url: `${apiBase}/IncomingPhoneNumbers` },
       { name: 'Applications (no account)', url: `${apiBase}/Applications` },
       { name: 'Calls', url: `${apiBase}/Calls` },
@@ -356,7 +368,7 @@ export async function handleDebugAccount(env: Env): Promise<Response> {
     }
 
     return Response.json({
-      accountId: accountId.substring(0, 8) + '...',
+      accountId: env.FREECLIMB_ACCOUNT_ID.substring(0, 8) + '...',
       results,
     });
 
@@ -369,13 +381,10 @@ export async function handleDebugAccount(env: Env): Promise<Response> {
  * List FreeClimb phone numbers endpoint
  */
 export async function handleListPhoneNumbers(env: Env): Promise<Response> {
-  const accountId = env.FREECLIMB_ACCOUNT_ID;
-  const apiKey = env.FREECLIMB_API_KEY;
-  const auth = btoa(`${accountId}:${apiKey}`);
-  const apiBase = 'https://www.freeclimb.com/apiserver';
+  const { auth, apiBase } = freeclimbAuth(env);
 
   try {
-    const response = await fetch(`${apiBase}/Accounts/${accountId}/IncomingPhoneNumbers`, {
+    const response = await fetch(`${apiBase}/Accounts/${env.FREECLIMB_ACCOUNT_ID}/IncomingPhoneNumbers`, {
       headers: {
         'Authorization': `Basic ${auth}`,
       },
@@ -422,15 +431,12 @@ export async function handleSetup(request: Request, env: Env): Promise<Response>
   const body = await request.json() as { phoneNumber?: string };
   const baseUrl = new URL(request.url).origin;
 
-  const accountId = env.FREECLIMB_ACCOUNT_ID;
-  const apiKey = env.FREECLIMB_API_KEY;
-  const auth = btoa(`${accountId}:${apiKey}`);
-  const apiBase = 'https://www.freeclimb.com/apiserver';
+  const { auth, apiBase } = freeclimbAuth(env);
 
   try {
     // Step 1: Create FreeClimb Application
     console.log('Creating FreeClimb application...');
-    const appResponse = await fetch(`${apiBase}/Accounts/${accountId}/Applications`, {
+    const appResponse = await fetch(`${apiBase}/Accounts/${env.FREECLIMB_ACCOUNT_ID}/Applications`, {
       method: 'POST',
       headers: {
         'Authorization': `Basic ${auth}`,
@@ -453,7 +459,7 @@ export async function handleSetup(request: Request, env: Env): Promise<Response>
 
     // Step 2: Get phone numbers
     console.log('Fetching phone numbers...');
-    const numbersResponse = await fetch(`${apiBase}/Accounts/${accountId}/IncomingPhoneNumbers`, {
+    const numbersResponse = await fetch(`${apiBase}/Accounts/${env.FREECLIMB_ACCOUNT_ID}/IncomingPhoneNumbers`, {
       headers: {
         'Authorization': `Basic ${auth}`,
       },
@@ -496,7 +502,7 @@ export async function handleSetup(request: Request, env: Env): Promise<Response>
 
     console.log(`Configuring phone number ${targetNumber.phoneNumber}...`);
     const updateResponse = await fetch(
-      `${apiBase}/Accounts/${accountId}/IncomingPhoneNumbers/${targetNumber.phoneNumberId}`,
+      `${apiBase}/Accounts/${env.FREECLIMB_ACCOUNT_ID}/IncomingPhoneNumbers/${targetNumber.phoneNumberId}`,
       {
         method: 'POST',
         headers: {
@@ -541,14 +547,11 @@ export async function handleSetup(request: Request, env: Env): Promise<Response>
 export async function handleUpdatePhoneNumber(request: Request, env: Env): Promise<Response> {
   const body = await request.json() as { phoneNumberId: string; alias?: string };
 
-  const accountId = env.FREECLIMB_ACCOUNT_ID;
-  const apiKey = env.FREECLIMB_API_KEY;
-  const auth = btoa(`${accountId}:${apiKey}`);
-  const apiBase = 'https://www.freeclimb.com/apiserver';
+  const { auth, apiBase } = freeclimbAuth(env);
 
   try {
     const updateResponse = await fetch(
-      `${apiBase}/Accounts/${accountId}/IncomingPhoneNumbers/${body.phoneNumberId}`,
+      `${apiBase}/Accounts/${env.FREECLIMB_ACCOUNT_ID}/IncomingPhoneNumbers/${body.phoneNumberId}`,
       {
         method: 'POST',
         headers: {
@@ -586,20 +589,17 @@ export async function handleGetLogs(request: Request, env: Env): Promise<Respons
   const url = new URL(request.url);
   const callId = url.searchParams.get('callId');
 
-  const accountId = env.FREECLIMB_ACCOUNT_ID;
-  const apiKey = env.FREECLIMB_API_KEY;
-  const auth = btoa(`${accountId}:${apiKey}`);
-  const apiBase = 'https://www.freeclimb.com/apiserver';
+  const { auth, apiBase } = freeclimbAuth(env);
 
   try {
     let logsUrl: string;
 
     if (callId) {
       // Get logs for specific call
-      logsUrl = `${apiBase}/Accounts/${accountId}/Calls/${callId}/Logs`;
+      logsUrl = `${apiBase}/Accounts/${env.FREECLIMB_ACCOUNT_ID}/Calls/${callId}/Logs`;
     } else {
       // Get recent logs (last 50)
-      logsUrl = `${apiBase}/Accounts/${accountId}/Logs`;
+      logsUrl = `${apiBase}/Accounts/${env.FREECLIMB_ACCOUNT_ID}/Logs`;
     }
 
     const response = await fetch(logsUrl, {
@@ -632,15 +632,12 @@ export async function handleGetLogs(request: Request, env: Env): Promise<Respons
  */
 export async function handleUpdateApplication(request: Request, env: Env): Promise<Response> {
   const baseUrl = new URL(request.url).origin;
-  const accountId = env.FREECLIMB_ACCOUNT_ID;
-  const apiKey = env.FREECLIMB_API_KEY;
-  const auth = btoa(`${accountId}:${apiKey}`);
-  const apiBase = 'https://www.freeclimb.com/apiserver';
+  const { auth, apiBase } = freeclimbAuth(env);
 
   try {
     // Step 1: List all applications to find the Voxnos one
     console.log('Fetching applications...');
-    const appsResponse = await fetch(`${apiBase}/Accounts/${accountId}/Applications`, {
+    const appsResponse = await fetch(`${apiBase}/Accounts/${env.FREECLIMB_ACCOUNT_ID}/Applications`, {
       headers: {
         'Authorization': `Basic ${auth}`,
       },
@@ -687,7 +684,7 @@ export async function handleUpdateApplication(request: Request, env: Env): Promi
 
     console.log(`Updating voiceUrl to: ${newVoiceUrl}`);
     const updateResponse = await fetch(
-      `${apiBase}/Accounts/${accountId}/Applications/${voxnosApp.applicationId}`,
+      `${apiBase}/Accounts/${env.FREECLIMB_ACCOUNT_ID}/Applications/${voxnosApp.applicationId}`,
       {
         method: 'POST',
         headers: {

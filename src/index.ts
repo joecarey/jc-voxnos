@@ -25,13 +25,28 @@ import {
 } from './routes.js';
 import { callElevenLabs, callGoogleTTS, computeTtsSignature } from './tts/index.js';
 
-// Register tools
-toolRegistry.register(new WeatherTool());
-toolRegistry.register(new CognosTool());
+// Deferred setup — runs once per isolate on first request so env is available.
+let setupDone = false;
+function setup(env: Env): void {
+  if (setupDone) return;
+  toolRegistry.register(new WeatherTool());
+  toolRegistry.register(new CognosTool(env.COGNOS_PUBLIC_KEY));
+  registry.register(new EchoApp());
+  registry.register(new ClaudeAssistant(), true);
+  setupDone = true;
+}
 
-// Register apps
-registry.register(new EchoApp());                // Simple echo demo
-registry.register(new ClaudeAssistant(), true);  // Default: Claude-powered assistant
+async function requireAdmin(request: Request, env: Env): Promise<Response | null> {
+  const auth = requireAdminAuth(request, env);
+  if (!auth.authorized) return createUnauthorizedResponse(auth.error!);
+
+  const authHeader = request.headers.get('Authorization');
+  const apiKey = authHeader?.match(/^Bearer\s+(.+)$/i)?.[1] || 'unknown';
+  const rateLimit = await checkRateLimit(env.RATE_LIMIT_KV, `admin:${apiKey.substring(0, 16)}`, RATE_LIMITS.ADMIN);
+  if (!rateLimit.allowed) return new Response('Admin rate limit exceeded', { status: 429, headers: { 'Retry-After': '60' } });
+
+  return null;
+}
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -44,6 +59,8 @@ export default {
         headers: { 'Content-Type': 'text/plain' },
       });
     }
+
+    setup(env);
 
     const url = new URL(request.url);
 
@@ -84,14 +101,7 @@ export default {
         }, { status: 429 });
       }
 
-      // Re-create request with parsed body for handleConversation
-      const newRequest = new Request(request.url, {
-        method: request.method,
-        headers: request.headers,
-        body: JSON.stringify(body),
-      });
-
-      return handleConversation(newRequest, env, ctx);
+      return handleConversation(request, env, ctx, body);
     }
 
     // Health check
@@ -106,104 +116,50 @@ export default {
 
     // Debug FreeClimb account
     if (url.pathname === '/debug/account' && request.method === 'GET') {
-      const auth = requireAdminAuth(request, env);
-      if (!auth.authorized) return createUnauthorizedResponse(auth.error!);
-
-      // Rate limit admin operations
-      const authHeader = request.headers.get('Authorization');
-      const apiKey = authHeader?.match(/^Bearer\s+(.+)$/i)?.[1] || 'unknown';
-      const rateLimit = await checkRateLimit(env.RATE_LIMIT_KV, `admin:${apiKey.substring(0, 16)}`, RATE_LIMITS.ADMIN);
-      if (!rateLimit.allowed) {
-        return new Response('Admin rate limit exceeded', { status: 429, headers: { 'Retry-After': '60' } });
-      }
-
+      const denied = await requireAdmin(request, env);
+      if (denied) return denied;
       return handleDebugAccount(env);
     }
 
     // List FreeClimb phone numbers
     if (url.pathname === '/phone-numbers' && request.method === 'GET') {
-      const auth = requireAdminAuth(request, env);
-      if (!auth.authorized) return createUnauthorizedResponse(auth.error!);
-
-      // Rate limit admin operations
-      const authHeader = request.headers.get('Authorization');
-      const apiKey = authHeader?.match(/^Bearer\s+(.+)$/i)?.[1] || 'unknown';
-      const rateLimit = await checkRateLimit(env.RATE_LIMIT_KV, `admin:${apiKey.substring(0, 16)}`, RATE_LIMITS.ADMIN);
-      if (!rateLimit.allowed) {
-        return new Response('Admin rate limit exceeded', { status: 429, headers: { 'Retry-After': '60' } });
-      }
-
+      const denied = await requireAdmin(request, env);
+      if (denied) return denied;
       return handleListPhoneNumbers(env);
     }
 
     // Setup FreeClimb application and phone number
     if (url.pathname === '/setup' && request.method === 'POST') {
-      const auth = requireAdminAuth(request, env);
-      if (!auth.authorized) return createUnauthorizedResponse(auth.error!);
-
-      // Rate limit admin operations
-      const authHeader = request.headers.get('Authorization');
-      const apiKey = authHeader?.match(/^Bearer\s+(.+)$/i)?.[1] || 'unknown';
-      const rateLimit = await checkRateLimit(env.RATE_LIMIT_KV, `admin:${apiKey.substring(0, 16)}`, RATE_LIMITS.ADMIN);
-      if (!rateLimit.allowed) {
-        return new Response('Admin rate limit exceeded', { status: 429, headers: { 'Retry-After': '60' } });
-      }
-
+      const denied = await requireAdmin(request, env);
+      if (denied) return denied;
       return handleSetup(request, env);
     }
 
     // Update phone number alias
     if (url.pathname === '/update-number' && request.method === 'POST') {
-      const auth = requireAdminAuth(request, env);
-      if (!auth.authorized) return createUnauthorizedResponse(auth.error!);
-
-      // Rate limit admin operations
-      const authHeader = request.headers.get('Authorization');
-      const apiKey = authHeader?.match(/^Bearer\s+(.+)$/i)?.[1] || 'unknown';
-      const rateLimit = await checkRateLimit(env.RATE_LIMIT_KV, `admin:${apiKey.substring(0, 16)}`, RATE_LIMITS.ADMIN);
-      if (!rateLimit.allowed) {
-        return new Response('Admin rate limit exceeded', { status: 429, headers: { 'Retry-After': '60' } });
-      }
-
+      const denied = await requireAdmin(request, env);
+      if (denied) return denied;
       return handleUpdatePhoneNumber(request, env);
     }
 
     // Get FreeClimb logs
     if (url.pathname === '/logs' && request.method === 'GET') {
-      const auth = requireAdminAuth(request, env);
-      if (!auth.authorized) return createUnauthorizedResponse(auth.error!);
-
-      // Rate limit admin operations
-      const authHeader = request.headers.get('Authorization');
-      const apiKey = authHeader?.match(/^Bearer\s+(.+)$/i)?.[1] || 'unknown';
-      const rateLimit = await checkRateLimit(env.RATE_LIMIT_KV, `admin:${apiKey.substring(0, 16)}`, RATE_LIMITS.ADMIN);
-      if (!rateLimit.allowed) {
-        return new Response('Admin rate limit exceeded', { status: 429, headers: { 'Retry-After': '60' } });
-      }
-
+      const denied = await requireAdmin(request, env);
+      if (denied) return denied;
       return handleGetLogs(request, env);
     }
 
     // Update FreeClimb application URLs
     if (url.pathname === '/update-app' && request.method === 'POST') {
-      const auth = requireAdminAuth(request, env);
-      if (!auth.authorized) return createUnauthorizedResponse(auth.error!);
-
-      // Rate limit admin operations
-      const authHeader = request.headers.get('Authorization');
-      const apiKey = authHeader?.match(/^Bearer\s+(.+)$/i)?.[1] || 'unknown';
-      const rateLimit = await checkRateLimit(env.RATE_LIMIT_KV, `admin:${apiKey.substring(0, 16)}`, RATE_LIMITS.ADMIN);
-      if (!rateLimit.allowed) {
-        return new Response('Admin rate limit exceeded', { status: 429, headers: { 'Retry-After': '60' } });
-      }
-
+      const denied = await requireAdmin(request, env);
+      if (denied) return denied;
       return handleUpdateApplication(request, env);
     }
 
     // Cost tracking summary
     if (url.pathname === '/costs' && request.method === 'GET') {
-      const auth = requireAdminAuth(request, env);
-      if (!auth.authorized) return createUnauthorizedResponse(auth.error!);
+      const denied = await requireAdmin(request, env);
+      if (denied) return denied;
 
       const days: Array<{ date: string; input_tokens: number; output_tokens: number; requests: number }> = [];
       for (let i = 0; i < 14; i++) {
@@ -216,7 +172,7 @@ export default {
       return Response.json({ service: 'voxnos', days });
     }
 
-    // Direct ElevenLabs TTS endpoint — called by FreeClimb Play command (TTS_MODE=direct)
+    // On-demand TTS endpoint — called by FreeClimb Play command (TTS_MODE=google|11labs)
     // URL is HMAC-signed by our Worker; random callers cannot forge a valid signature
     if (url.pathname === '/tts' && request.method === 'GET') {
       const text = url.searchParams.get('text');
@@ -241,7 +197,7 @@ export default {
           audioBuffer = await callGoogleTTS(decodedText, env.GOOGLE_TTS_API_KEY!);
           contentType = 'audio/wav';
         } else {
-          audioBuffer = await callElevenLabs(decodedText, env.ELEVENLABS_API_KEY, voiceId ?? undefined, env.ELEVENLABS_BASE_URL);
+          audioBuffer = await callElevenLabs(decodedText, env.ELEVENLABS_API_KEY!, voiceId ?? undefined, env.ELEVENLABS_BASE_URL);
           contentType = 'audio/mpeg';
         }
         return new Response(audioBuffer, {

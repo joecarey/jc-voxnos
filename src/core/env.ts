@@ -6,15 +6,13 @@ import type { Env } from './types.js';
  * Required environment variables
  */
 const REQUIRED_ENV_VARS = [
-  'SUPABASE_URL',
-  'SUPABASE_SERVICE_ROLE_KEY',
   'FREECLIMB_ACCOUNT_ID',
   'FREECLIMB_API_KEY',
   'FREECLIMB_SIGNING_SECRET',
   'ANTHROPIC_API_KEY',
   'ADMIN_API_KEY',
-  'ELEVENLABS_API_KEY',
   'TTS_SIGNING_SECRET',
+  'COGNOS_PUBLIC_KEY',
 ] as const;
 
 /**
@@ -51,9 +49,13 @@ export function validateEnv(env: Partial<Env>): EnvValidationResult {
     }
   }
 
-  // Additional validation for specific variables
-  if (env.SUPABASE_URL && !isValidUrl(env.SUPABASE_URL)) {
-    errors.push('SUPABASE_URL must be a valid URL');
+  // Mode-conditional TTS key requirements
+  const ttsMode = env.TTS_MODE ?? 'freeclimb';
+  if (ttsMode === 'google' && !env.GOOGLE_TTS_API_KEY) {
+    errors.push('GOOGLE_TTS_API_KEY is required when TTS_MODE=google');
+  }
+  if (ttsMode === '11labs' && !env.ELEVENLABS_API_KEY) {
+    errors.push('ELEVENLABS_API_KEY is required when TTS_MODE=11labs');
   }
 
   return {
@@ -61,39 +63,6 @@ export function validateEnv(env: Partial<Env>): EnvValidationResult {
     missing,
     errors,
   };
-}
-
-/**
- * Validate environment variables and throw error if invalid
- * Use this in the fetch handler to ensure environment is configured correctly
- *
- * @param env - Environment object to validate
- * @throws Error if validation fails
- */
-export function assertValidEnv(env: Partial<Env>): asserts env is Env {
-  const result = validateEnv(env);
-
-  if (!result.valid) {
-    const errorMessage = [
-      'Environment validation failed:',
-      ...result.missing.map(v => `  - Missing: ${v}`),
-      ...result.errors.map(e => `  - Error: ${e}`),
-    ].join('\n');
-
-    throw new Error(errorMessage);
-  }
-}
-
-/**
- * Simple URL validation helper
- */
-function isValidUrl(urlString: string): boolean {
-  try {
-    const url = new URL(urlString);
-    return url.protocol === 'http:' || url.protocol === 'https:';
-  } catch {
-    return false;
-  }
 }
 
 /**
