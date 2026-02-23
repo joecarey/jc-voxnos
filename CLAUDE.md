@@ -6,12 +6,13 @@ Multi-app voice platform: FreeClimb telephony + Claude Sonnet 4.6 + Google Chirp
 
 **Call flow**: `/call` → App Router → `app.onStart()` greeting. `/conversation` → `app.onSpeech()` → Claude + tools → `streamSpeech()` → KV → Play commands.
 
-**Source**: `src/index.ts` (routing, /tts /tts-cache /continue), `src/routes.ts` (handleConversation, streaming V2), `src/apps/claude-assistant.ts` (default app), `src/tools/` (weather, cognos), `src/tts/` (google, elevenlabs, freeclimb providers), `src/percl/builder.ts`, `src/core/` (types, registry, auth, webhook-auth, rate-limit, env).
+**Source**: `src/index.ts` (routing, /tts /tts-cache /continue), `src/routes.ts` (handleConversation, streaming V2, pre-filler), `src/apps/ava.ts` (default app), `src/apps/otto.ts` (dormant snapshot), `src/tools/` (weather, cognos), `src/tts/` (google, elevenlabs, freeclimb providers), `src/percl/builder.ts`, `src/core/` (types, registry, auth, webhook-auth, rate-limit, env).
 
 ## Registered Apps
 
 - `EchoApp` — demo only
-- `ClaudeAssistant` — **default** — Claude Sonnet 4.6 (`claude-sonnet-4-6`), tools (weather + cognos), streaming TTS, KV conversation history
+- `OttoAssistant` — dormant snapshot of pre-Ava assistant (2026-02-23); not routed to any FreeClimb number
+- `AvaAssistant` — **default** — Claude Sonnet 4.6 (`claude-sonnet-4-6`), tools (weather + cognos), streaming TTS, KV conversation history. Warm/familiar personality ("Ava"), informal greetings, short fillers, concise goodbyes.
 
 ## HTTP Endpoints
 
@@ -22,7 +23,7 @@ Multi-app voice platform: FreeClimb telephony + Claude Sonnet 4.6 + Google Chirp
 ### TTS (public, HMAC-signed URLs)
 - `GET /tts` — on-demand: `?text=...&sig=...` — validates HMAC, calls Google/ElevenLabs, returns audio
 - `GET /tts-cache` — KV-backed: `?id=...` — serves pre-generated audio, `Cache-Control: no-store`
-- `GET /continue` — streaming chain: polls KV for next sentence (15×500ms), returns Play+Redirect or TranscribeUtterance
+- `GET /continue` — streaming chain: polls KV for next sentence (25×500ms, ~12.5s max), returns Play+Redirect, Play+Pause+Hangup (if hangup marker), or TranscribeUtterance
 
 ### Admin (Bearer: ADMIN_API_KEY)
 - `GET /debug/account`, `GET /phone-numbers`, `POST /setup`, `POST /update-number`, `POST /update-app`
@@ -41,9 +42,11 @@ Multi-app voice platform: FreeClimb telephony + Claude Sonnet 4.6 + Google Chirp
 ## Streaming Flow (TTS_MODE=google|11labs)
 
 1. `streamSpeech()` yields sentences from Claude's streaming response
-2. First sentence: TTS'd immediately → KV → `Play` + `Redirect` to `/continue`
-3. Remaining: background via `ctx.waitUntil()`, stored in KV with per-turn UUID
-4. `/continue` polls KV (15×500ms, ~7.5s max) → `Play+Redirect` or `TranscribeUtterance`
+2. **Pre-filler path** (50% coin flip, non-goodbye): cached filler ("On it.", "One sec.") played immediately → full stream runs in background → `/continue` picks up real sentences. Skips app-yielded fillers to prevent double-filler.
+3. **Standard path** (other 50% or no fillerPhrases): first sentence TTS'd immediately → KV → `Play` + `Redirect` to `/continue`
+4. Remaining: background via `ctx.waitUntil()`, stored in KV with per-turn UUID
+5. `/continue` polls KV (25×500ms, ~12.5s max) → `Play+Redirect`, `Play+Pause+Hangup` (hangup marker), or `TranscribeUtterance`
+6. **Hangup-via-KV**: `processRemainingStream` detects hangup chunks, writes `{callKey}:hangup` marker, `/continue` returns Hangup instead of Redirect
 
 ## KV Schema (RATE_LIMIT_KV)
 
@@ -53,6 +56,7 @@ Multi-app voice platform: FreeClimb telephony + Claude Sonnet 4.6 + Google Chirp
 | `tts:{uuid}` | audio ArrayBuffer | 120s | per-sentence streaming audio |
 | `stream:{callId}:{turnId}:{n}` | UUID string | 120s | sentence index pointer |
 | `stream:{callId}:{turnId}:done` | `'1'` | 120s | stream completion signal |
+| `stream:{callId}:{turnId}:hangup` | sentence index string | 120s | hangup marker for /continue |
 | `conv:{callId}` | JSON messages | 15min | conversation history |
 | `rl:{prefix}:{id}:{bucket}` | count string | 120s | rate limiting |
 | `costs:voxnos:{date}` | JSON token counts | 90d | cost tracking |
@@ -64,10 +68,12 @@ Multi-app voice platform: FreeClimb telephony + Claude Sonnet 4.6 + Google Chirp
 - Do not weaken rate limiting
 - Keep `voiceSlug(env)` appended to all stable TTS cache keys
 - Keep `Cache-Control: no-store` on all `/tts-cache` responses
+- Pre-filler path must skip app-yielded fillers (`skipFillers`) to prevent double-filler
+- `processRemainingStream` must write hangup marker and fire `onHangup` on hangup chunks
 
 ## Cognos Dependency
 
-Calls `POST https://jc-cognos.cloudflare-5cf.workers.dev/brief` via the `cognos` tool.
+Calls `POST /brief` via Cloudflare Service Binding (`env.COGNOS` Fetcher) — internal routing, no public URL.
 
 - Auth: `COGNOS_PUBLIC_KEY` Bearer token
 - Request: `{q, voice_mode: true, voice_detail: 1–5}`
@@ -76,15 +82,17 @@ Calls `POST https://jc-cognos.cloudflare-5cf.workers.dev/brief` via the `cognos`
 
 ## Recent changes
 
-- Cognos tool (`src/tools/cognos.ts`) now includes retry/backoff for transient HTTP errors (429/5xx).
-- System prompt updated: Claude now has explicit guidance on when to use `get_industry_brief` vs `get_weather` vs answering general questions from its own knowledge.
-- Removed hardcoded brief-detection quick-path — Claude's tool-use loop handles all tool routing.
-- `onEnd()` now wired up: fires via `ctx.waitUntil()` on hangup in both streaming and non-streaming paths.
-- `VOICE_SLUG` replaced with `voiceSlug(env)` function — derives slug from active TTS mode so cache keys are correct when switching providers.
-- Removed dead code: `/transfer` endpoint reference (no handler existed), `OutDial` PerCL type, `transfer` field from `AppResponse`, unused `DEFAULT_TTS_PROVIDER`, unused `TOOL_COGNOS`/`TOOL_WEATHER` rate limit configs, `@supabase/supabase-js` dependency.
+- **Ava rebrand**: `ClaudeAssistant` → `AvaAssistant` (`src/apps/ava.ts`). Named system prompt ("You are Ava"), informal greetings (random, no time-of-day), short fillers, warm goodbyes.
+- **Otto snapshot**: `OttoAssistant` (`src/apps/otto.ts`) — frozen copy of pre-Ava assistant with original personality. Dormant (no FreeClimb number).
+- **Pre-filler acknowledgments**: route layer plays a cached filler immediately on 50% of non-goodbye turns (`PRE_FILLER_PROBABILITY`). Fills dead air during Anthropic API TTFB. `VoxnosApp.fillerPhrases` lets each app declare its own set.
+- **Hangup-via-KV marker**: `processRemainingStream` writes `{callKey}:hangup` when it encounters a hangup chunk. `/continue` checks this and returns Play+Pause+Hangup. Covers edge cases where goodbye detection at the route layer has a false negative.
+- **Cognos Service Binding**: `env.COGNOS` Fetcher replaces public workers.dev URL — eliminates same-account edge routing 404s.
+- **Tool result compression**: `compressToolResults()` truncates tool_result blocks >120 chars before saving to KV, keeping token count bounded across multi-turn calls.
+- `/continue` poll window increased from 15 to 25 attempts (~12.5s max).
+- Removed dead code: `/transfer`, `OutDial`, unused rate limit configs, `@supabase/supabase-js`.
 
 Downstream impact:
-- No change to tool definitions or KV schemas; keep `COGNOS_PUBLIC_KEY` present in env.
+- New KV key pattern: `stream:{callId}:{turnId}:hangup`. No change to tool definitions. Keep `COGNOS_PUBLIC_KEY` and `COGNOS` Service Binding present in env.
 
 ## Environment
 
@@ -97,6 +105,7 @@ ELEVENLABS_API_KEY    # required when TTS_MODE=11labs
 ```
 **Vars (wrangler.toml):** `TTS_MODE = "google"`
 **KV:** `RATE_LIMIT_KV` (id: `58a6ac9954ea44d2972ba2cb9e1e077e`)
+**Service Binding:** `COGNOS` → `jc-cognos` Worker
 
 ## Ava Platform Context
 
@@ -108,7 +117,7 @@ CI/CD: GitHub Actions on push to `master`. Manual: `npx wrangler deploy`. Dev: `
 
 ## Adding a New App
 
-1. Create `src/apps/my-app.ts` implementing `VoxnosApp` (`onStart`, `onSpeech`, optional `onEnd`, optional `streamSpeech`)
+1. Create `src/apps/my-app.ts` implementing `VoxnosApp` (`onStart`, `onSpeech`, optional `onEnd`, optional `streamSpeech`, optional `fillerPhrases`)
 2. Register in `src/index.ts`: `registry.register(new MyApp())` — pass `true` as second arg for default
 
 ## Mesh Protocol
