@@ -95,7 +95,7 @@ export async function buildPerCL(
         playBeep: false,
         record: {
           maxLengthSec: 25,
-          rcrdTerminationSilenceTimeMs: 4000,
+          rcrdTerminationSilenceTimeMs: 3000,
         },
       },
     });

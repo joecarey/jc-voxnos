@@ -244,6 +244,7 @@ export async function handleConversation(
 
     // If no transcription, ask to repeat using a cached Play (same voice as the rest of the call)
     if (!input.text || input.text.trim() === '') {
+      console.log(JSON.stringify({ event: 'no_input', callId: body.callId, transcribeReason: body.transcribeReason, timestamp: new Date().toISOString() }));
       const origin = new URL(request.url).origin;
       const retryIdx = Math.floor(Math.random() * RETRY_PHRASES.length);
       const retryText = RETRY_PHRASES[retryIdx];
@@ -259,7 +260,7 @@ export async function handleConversation(
           TranscribeUtterance: {
             actionUrl: `${origin}/conversation`,
             playBeep: false,
-            record: { maxLengthSec: 25, rcrdTerminationSilenceTimeMs: 4000 },
+            record: { maxLengthSec: 25, rcrdTerminationSilenceTimeMs: 3000 },
           },
         },
       ], { headers: { 'Content-Type': 'application/json' } });
@@ -281,6 +282,7 @@ export async function handleConversation(
         const usePreFiller = fillers?.length && !looksLikeGoodbye(input.text) && Math.random() < PRE_FILLER_PROBABILITY;
 
         if (usePreFiller) {
+          console.log(JSON.stringify({ event: 'pre_filler', callId: context.callId, turnId, timestamp: new Date().toISOString() }));
           const fillerIdx = Math.floor(Math.random() * fillers.length);
           const fillerText = fillers[fillerIdx];
           const fillerId = `filler-${fillerIdx}-${voiceSlug(env)}`;

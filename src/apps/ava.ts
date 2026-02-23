@@ -98,7 +98,7 @@ export const GOODBYE_PHRASES = [
   'Later. Call anytime.',
   'Take care.',
   'Alright, talk soon.',
-  "You got it. I'm here if you need me.",
+  'No problem. Goodbye.',
   'Bye for now.',
 ];
 

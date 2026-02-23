@@ -248,22 +248,27 @@ export default {
       const nextN = n + 1;
       const origin = new URL(request.url).origin;
 
-      // Poll up to 25 attempts (0ms, 500ms, ... 12s) for background TTS to finish.
-      // Cognos briefs take ~3-8s (upstream AI call + TTS), so 7.5s wasn't enough.
+      // Poll for background TTS to finish. Use short intervals to minimise
+      // dead air but stay well under FreeClimb's webhook response timeout (~15s).
+      // 15 × 500ms = 7.5s max; Cognos briefs take ~3-8s so this is usually enough.
+      const pollStart = Date.now();
       let nextId: string | null = null;
-      for (let attempt = 0; attempt < 25; attempt++) {
+      let pollAttempts = 0;
+      for (let attempt = 0; attempt < 15; attempt++) {
         if (attempt > 0) await new Promise(r => setTimeout(r, 500));
+        pollAttempts = attempt + 1;
         nextId = await env.RATE_LIMIT_KV.get(`${callKey}:${nextN}`);
         if (nextId) break;
         const done = await env.RATE_LIMIT_KV.get(`${callKey}:done`);
         if (done) break;
       }
+      console.log(JSON.stringify({ event: 'continue_poll', callId, n, nextN, found: !!nextId, attempts: pollAttempts, elapsed_ms: Date.now() - pollStart }));
 
       const transcribeUtterance = {
         TranscribeUtterance: {
           actionUrl: `${origin}/conversation`,
           playBeep: false,
-          record: { maxLengthSec: 25, rcrdTerminationSilenceTimeMs: 4000 },
+          record: { maxLengthSec: 25, rcrdTerminationSilenceTimeMs: 3000 },
         },
       };
 
