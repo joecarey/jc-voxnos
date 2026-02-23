@@ -5,12 +5,15 @@ export interface Env {
   SUPABASE_SERVICE_ROLE_KEY: string;
   FREECLIMB_ACCOUNT_ID: string;
   FREECLIMB_API_KEY: string;
+  FREECLIMB_SIGNING_SECRET: string;
   ANTHROPIC_API_KEY: string;
   ADMIN_API_KEY: string;
   RATE_LIMIT_KV: KVNamespace;
   ELEVENLABS_API_KEY: string;
+  ELEVENLABS_BASE_URL?: string;  // optional: override ElevenLabs API base (e.g. Cloudflare AI Gateway)
   TTS_SIGNING_SECRET: string;
-  TTS_MODE?: string;  // 'freeclimb' (default) | 'direct'
+  GOOGLE_TTS_API_KEY?: string;  // required when TTS_MODE=google
+  TTS_MODE?: string;  // 'freeclimb' (default) | '11labs' | 'google'
 }
 
 export interface AppContext {
@@ -41,6 +44,13 @@ export interface AppResponse {
   transfer?: string;       // Phone number to transfer to
 }
 
+// A single sentence chunk yielded by streamSpeech
+export interface StreamChunk {
+  text: string;
+  hangup?: true;       // If set, the call should end after this sentence
+  cacheKey?: string;   // If set, use this stable KV key (cache-first, long TTL) instead of a fresh UUID
+}
+
 // Base interface that all apps must implement
 export interface VoxnosApp {
   id: string;            // Unique app identifier
@@ -55,6 +65,6 @@ export interface VoxnosApp {
   // Handle end of call
   onEnd?(context: AppContext): Promise<void>;
 
-  // Optional: stream sentences one at a time for lower-latency TTS (V2 path, TTS_MODE=direct)
-  streamSpeech?(context: AppContext, input: SpeechInput): AsyncGenerator<string, void, undefined>;
+  // Optional: stream sentences one at a time for lower-latency TTS (V2 path, TTS_MODE=11labs)
+  streamSpeech?(context: AppContext, input: SpeechInput): AsyncGenerator<StreamChunk, void, undefined>;
 }

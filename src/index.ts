@@ -23,7 +23,7 @@ import {
   handleGetLogs,
   handleUpdateApplication,
 } from './routes.js';
-import { callElevenLabs, computeTtsSignature } from './tts/index.js';
+import { callElevenLabs, callGoogleTTS, computeTtsSignature } from './tts/index.js';
 
 // Register tools
 toolRegistry.register(new WeatherTool());
@@ -49,7 +49,7 @@ export default {
 
     // FreeClimb call webhook - handles incoming calls
     if (url.pathname === '/call' && request.method === 'POST') {
-      const webhookAuth = await validateWebhook(request, env.FREECLIMB_API_KEY);
+      const webhookAuth = await validateWebhook(request, env.FREECLIMB_SIGNING_SECRET);
       if (!webhookAuth.valid) {
         return createWebhookUnauthorizedResponse(webhookAuth.error!);
       }
@@ -67,7 +67,7 @@ export default {
 
     // FreeClimb conversation webhook - handles each turn of dialogue
     if (url.pathname === '/conversation' && request.method === 'POST') {
-      const webhookAuth = await validateWebhook(request, env.FREECLIMB_API_KEY);
+      const webhookAuth = await validateWebhook(request, env.FREECLIMB_SIGNING_SECRET);
       if (!webhookAuth.valid) {
         return createWebhookUnauthorizedResponse(webhookAuth.error!);
       }
@@ -235,9 +235,17 @@ export default {
       }
 
       try {
-        const audioBuffer = await callElevenLabs(decodedText, env.ELEVENLABS_API_KEY, voiceId ?? undefined);
+        let audioBuffer: ArrayBuffer;
+        let contentType: string;
+        if (env.TTS_MODE === 'google') {
+          audioBuffer = await callGoogleTTS(decodedText, env.GOOGLE_TTS_API_KEY!);
+          contentType = 'audio/wav';
+        } else {
+          audioBuffer = await callElevenLabs(decodedText, env.ELEVENLABS_API_KEY, voiceId ?? undefined, env.ELEVENLABS_BASE_URL);
+          contentType = 'audio/mpeg';
+        }
         return new Response(audioBuffer, {
-          headers: { 'Content-Type': 'audio/mpeg' },
+          headers: { 'Content-Type': contentType },
         });
       } catch (err) {
         console.error('ElevenLabs TTS error:', err);
@@ -247,34 +255,48 @@ export default {
 
     // Pre-generated TTS audio cache — served by UUID (V2 streaming path)
     // UUID is unguessable (128-bit random), no additional signing needed
-    if (url.pathname === '/tts-cache' && request.method === 'GET') {
+    if (url.pathname === '/tts-cache' && (request.method === 'GET' || request.method === 'HEAD')) {
       const id = url.searchParams.get('id');
       if (!id) return new Response('Bad request', { status: 400 });
 
       const audio = await env.RATE_LIMIT_KV.get(`tts:${id}`, 'arrayBuffer');
       if (!audio) return new Response('Not found', { status: 404 });
 
-      return new Response(audio, {
-        headers: { 'Content-Type': 'audio/mpeg' },
-      });
+      // Detect format from magic bytes: WAV starts with "RIFF" (0x52 0x49 0x46 0x46)
+      const magic = new Uint8Array(audio, 0, 4);
+      const isWav = magic[0] === 0x52 && magic[1] === 0x49 && magic[2] === 0x46 && magic[3] === 0x46;
+      const headers = {
+        'Content-Type': isWav ? 'audio/wav' : 'audio/mpeg',
+        'Content-Length': String(audio.byteLength),
+        'Accept-Ranges': 'bytes',
+        'Cache-Control': 'no-store',
+      };
+
+      return new Response(request.method === 'HEAD' ? null : audio, { headers });
     }
 
     // V2 redirect chain — called by FreeClimb after playing sentence N, retrieves sentence N+1
     // callId is a FreeClimb-generated ID; unguessable in practice
-    if (url.pathname === '/continue' && request.method === 'GET') {
+    // FreeClimb's Redirect command sends POST; also accept GET for flexibility
+    if (url.pathname === '/continue' && (request.method === 'GET' || request.method === 'POST')) {
       const callId = url.searchParams.get('callId');
+      const turnId = url.searchParams.get('turn');
       const n = parseInt(url.searchParams.get('n') ?? '0', 10);
 
       if (!callId) return new Response('Bad request', { status: 400 });
 
-      const callKey = `stream:${callId}`;
+      // turnId namespaces each conversation turn; prevents stale reads from prior turns
+      const callKey = turnId ? `stream:${callId}:${turnId}` : `stream:${callId}`;
       const nextN = n + 1;
       const origin = new URL(request.url).origin;
 
-      // Poll up to 4 attempts (0ms, 200ms, 400ms, 600ms) for background TTS to finish
+      // Poll up to 15 attempts (0ms, 500ms, 1000ms, ... 7000ms) for background TTS to finish.
+      // The filler phrase is short (~1.5s audio), so FreeClimb calls /continue well before the
+      // tool call + Claude pass 2 + background TTS completes (~4-6s). We need to hold the
+      // /continue request open long enough for those to finish.
       let nextId: string | null = null;
-      for (let attempt = 0; attempt < 4; attempt++) {
-        if (attempt > 0) await new Promise(r => setTimeout(r, 200));
+      for (let attempt = 0; attempt < 15; attempt++) {
+        if (attempt > 0) await new Promise(r => setTimeout(r, 500));
         nextId = await env.RATE_LIMIT_KV.get(`${callKey}:${nextN}`);
         if (nextId) break;
         const done = await env.RATE_LIMIT_KV.get(`${callKey}:done`);
@@ -294,9 +316,10 @@ export default {
         return Response.json([transcribeUtterance]);
       }
 
+      const turnParam = turnId ? `&turn=${turnId}` : '';
       return Response.json([
         { Play: { file: `${origin}/tts-cache?id=${nextId}` } },
-        { Redirect: { actionUrl: `${origin}/continue?callId=${callId}&n=${nextN}` } },
+        { Redirect: { actionUrl: `${origin}/continue?callId=${callId}${turnParam}&n=${nextN}` } },
       ]);
     }
 

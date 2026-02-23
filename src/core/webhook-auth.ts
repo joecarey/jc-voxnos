@@ -11,14 +11,11 @@ export interface WebhookValidationResult {
 }
 
 /**
- * FreeClimb IP ranges (US-based cloud infrastructure)
- * Update this list based on FreeClimb's published IP ranges
+ * FreeClimb IP ranges (Vail Systems, Inc. — FreeClimb's parent)
  */
 const FREECLIMB_IP_ALLOWLIST = [
-  // FreeClimb webhook source IPs
-  // TODO: Get actual IP ranges from FreeClimb documentation
-  '3.0.0.0/8',      // Example AWS range
-  '52.0.0.0/8',     // Example AWS range
+  '63.209.0.0/16',   // Vail Systems / Flexential (ASN 19067) — observed: 63.209.137.92
+  '74.63.0.0/16',    // Flexential Colorado (ASN 19067) — observed: 74.63.156.93
 ];
 
 /**
@@ -36,14 +33,28 @@ const FREECLIMB_IP_ALLOWLIST = [
 export async function validateWebhookSignature(
   request: Request,
   signingSecret: string,
-  signatureHeader: string = 'X-FreeClimb-Signature'
+  signatureHeader: string = 'freeclimb-signature'
 ): Promise<WebhookValidationResult> {
-  const receivedSignature = request.headers.get(signatureHeader);
+  const headerValue = request.headers.get(signatureHeader);
 
-  if (!receivedSignature) {
+  if (!headerValue) {
     return {
       valid: false,
       error: `Missing ${signatureHeader} header`,
+    };
+  }
+
+  // FreeClimb signature format: "t=<timestamp>,v1=<hmac_hex>"
+  const parts = Object.fromEntries(
+    headerValue.split(',').map(p => p.split('=') as [string, string])
+  );
+  const timestamp = parts['t'];
+  const receivedHmac = parts['v1'];
+
+  if (!timestamp || !receivedHmac) {
+    return {
+      valid: false,
+      error: 'Malformed signature header',
     };
   }
 
@@ -51,7 +62,9 @@ export async function validateWebhookSignature(
   const clonedRequest = request.clone();
   const body = await clonedRequest.text();
 
-  // Compute expected signature
+  // FreeClimb signs: "<timestamp>.<body>"
+  const payload = `${timestamp}.${body}`;
+
   const encoder = new TextEncoder();
   const key = await crypto.subtle.importKey(
     'raw',
@@ -61,19 +74,13 @@ export async function validateWebhookSignature(
     ['sign']
   );
 
-  const signature = await crypto.subtle.sign(
-    'HMAC',
-    key,
-    encoder.encode(body)
-  );
+  const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(payload));
 
-  // Convert to hex string
-  const expectedSignature = Array.from(new Uint8Array(signature))
+  const expectedHmac = Array.from(new Uint8Array(signature))
     .map(b => b.toString(16).padStart(2, '0'))
     .join('');
 
-  // Compare signatures (constant-time comparison)
-  if (constantTimeCompare(receivedSignature, expectedSignature)) {
+  if (constantTimeCompare(receivedHmac, expectedHmac)) {
     return {
       valid: true,
       method: 'signature',

@@ -1,18 +1,57 @@
 // HTTP route handlers for voxnos platform
 
 import { registry } from './core/registry.js';
-import type { Env, AppContext, SpeechInput } from './core/types.js';
+import type { Env, AppContext, SpeechInput, StreamChunk } from './core/types.js';
 import { buildPerCL, sanitizeForTTS } from './percl/builder.js';
-import { ElevenLabsProvider, DirectElevenLabsProvider, ELEVENLABS_VOICE_ID, callElevenLabs } from './tts/index.js';
+import { ElevenLabsProvider, DirectElevenLabsProvider, FreeClimbDefaultProvider, ELEVENLABS_VOICE_ID, callElevenLabs, callGoogleTTS, GOOGLE_TTS_VOICE } from './tts/index.js';
+
+// Short voice identifier appended to all stable TTS cache keys.
+// When the voice changes, URLs change and FreeClimb's HTTP cache is automatically busted.
+const VOICE_SLUG = GOOGLE_TTS_VOICE.split('-').pop()!.toLowerCase();
+
+// Phrases for when the caller's speech wasn't captured — randomized to avoid repetition
+const RETRY_PHRASES = [
+  "I didn't catch that. Could you please repeat?",
+  "Sorry, I missed that. Could you say it again?",
+  "I didn't quite hear you. Could you repeat that?",
+  "Pardon? Could you say that again?",
+];
+
+/**
+ * Derive a stable, URL-safe KV cache key for a greeting phrase.
+ * There are only ~3 variants (morning/afternoon/evening), so the key is
+ * short and human-readable. Falls back to a sanitized prefix for any
+ * other greeting text that gets added in the future.
+ */
+function greetingCacheKey(text: string): string {
+  const lower = text.toLowerCase();
+  if (lower.includes('morning'))   return `greeting-morning-${VOICE_SLUG}`;
+  if (lower.includes('afternoon')) return `greeting-afternoon-${VOICE_SLUG}`;
+  if (lower.includes('evening'))   return `greeting-evening-${VOICE_SLUG}`;
+  // Generic fallback: alphanumeric slug, max 40 chars
+  return 'greeting-' + lower.replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40) + `-${VOICE_SLUG}`;
+}
 
 function getTTSProvider(env: Env) {
-  if (env.TTS_MODE === 'direct') {
+  if (env.TTS_MODE === '11labs') {
     return new DirectElevenLabsProvider({
       voiceId: ELEVENLABS_VOICE_ID,
       signingSecret: env.TTS_SIGNING_SECRET,
     });
   }
+  if (env.TTS_MODE === 'google') {
+    // Google mode uses the streaming/Play path — FreeClimbDefaultProvider is the safe fallback
+    // for the non-streaming buildPerCL path (should not be reached when streamSpeech is active)
+    return new FreeClimbDefaultProvider();
+  }
   return new ElevenLabsProvider({ voiceId: 'EXAVITQu4vr4xnSDxMaL', languageCode: 'en' });
+}
+
+function callTTS(text: string, env: Env): Promise<ArrayBuffer> {
+  if (env.TTS_MODE === 'google') {
+    return callGoogleTTS(text, env.GOOGLE_TTS_API_KEY!);
+  }
+  return callElevenLabs(text, env.ELEVENLABS_API_KEY, undefined, env.ELEVENLABS_BASE_URL);
 }
 
 /**
@@ -50,6 +89,29 @@ export async function handleIncomingCall(request: Request, env: Env): Promise<Re
 
     const response = await app.onStart(context);
 
+    // For direct TTS modes (google, 11labs), pre-generate greeting audio and use Play instead of Say.
+    // Greetings are one of ~3 fixed strings (morning/afternoon/evening), so we cache them with a
+    // stable KV key and a long TTL to avoid re-generating the same audio on every call.
+    if ((env.TTS_MODE === 'google' || env.TTS_MODE === '11labs') && response.speech?.text) {
+      const safeText = sanitizeForTTS(response.speech.text);
+      if (safeText) {
+        const origin = new URL(request.url).origin;
+        const greetingId = greetingCacheKey(safeText);
+
+        let audio = await env.RATE_LIMIT_KV.get(`tts:${greetingId}`, 'arrayBuffer');
+        if (audio) {
+          console.log(JSON.stringify({ event: 'greeting_cache_hit', key: greetingId, timestamp: new Date().toISOString() }));
+        } else {
+          audio = await callTTS(safeText, env);
+          // 6-hour TTL: covers voice/text updates while avoiding per-call TTS generation
+          await env.RATE_LIMIT_KV.put(`tts:${greetingId}`, audio, { expirationTtl: 6 * 60 * 60 });
+          console.log(JSON.stringify({ event: 'greeting_cache_miss', key: greetingId, timestamp: new Date().toISOString() }));
+        }
+
+        response.audioUrls = [`${origin}/tts-cache?id=${greetingId}`];
+      }
+    }
+
     // Convert app response to FreeClimb PerCL
     const percl = await buildPerCL(response, request.url, getTTSProvider(env));
 
@@ -72,18 +134,18 @@ export async function handleIncomingCall(request: Request, env: Env): Promise<Re
  * Stores each sentence's audio in KV and marks the stream as done when finished.
  */
 async function processRemainingStream(
-  sentenceStream: AsyncGenerator<string, void, undefined>,
+  sentenceStream: AsyncGenerator<StreamChunk, void, undefined>,
   callKey: string,
   env: Env,
   startIndex: number,
 ): Promise<void> {
   let n = startIndex;
   try {
-    for await (const sentence of sentenceStream) {
+    for await (const chunk of sentenceStream) {
       n++;
-      const safeSentence = sanitizeForTTS(sentence);
+      const safeSentence = sanitizeForTTS(chunk.text);
       if (!safeSentence) continue;
-      const audio = await callElevenLabs(safeSentence, env.ELEVENLABS_API_KEY);
+      const audio = await callTTS(safeSentence, env);
       const id = crypto.randomUUID();
       await env.RATE_LIMIT_KV.put(`tts:${id}`, audio, { expirationTtl: 120 });
       await env.RATE_LIMIT_KV.put(`${callKey}:${n}`, id, { expirationTtl: 120 });
@@ -99,117 +161,143 @@ async function processRemainingStream(
  * FreeClimb conversation webhook - handles each turn of dialogue
  */
 export async function handleConversation(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
-  const body = await request.json() as {
-    callId: string;
-    from: string;
-    to: string;
-    recordingId?: string;
-    recordingUrl?: string;
-    transcript?: string;
-    transcribeReason?: string;
-    transcriptionDurationMs?: number;
-  };
+  try {
+    const body = await request.json() as {
+      callId: string;
+      from: string;
+      to: string;
+      recordingId?: string;
+      recordingUrl?: string;
+      transcript?: string;
+      transcribeReason?: string;
+      transcriptionDurationMs?: number;
+    };
 
-  console.log(JSON.stringify({ event: 'conversation_turn', callId: body.callId, transcript_length: body.transcript?.length ?? 0, timestamp: new Date().toISOString() }));
+    console.log(JSON.stringify({ event: 'conversation_turn', callId: body.callId, transcript_length: body.transcript?.length ?? 0, transcribeReason: body.transcribeReason, timestamp: new Date().toISOString() }));
 
-  // Route to app
-  const app = registry.getForNumber(body.to);
+    // Route to app
+    const app = registry.getForNumber(body.to);
 
-  if (!app) {
-    return Response.json([{ Hangup: {} }]);
-  }
+    if (!app) {
+      return Response.json([{ Hangup: {} }]);
+    }
 
-  // Build context
-  const context: AppContext = {
-    env,
-    callId: body.callId,
-    from: body.from,
-    to: body.to,
-  };
+    // Build context
+    const context: AppContext = {
+      env,
+      callId: body.callId,
+      from: body.from,
+      to: body.to,
+    };
 
-  // Build speech input from transcription
-  const input: SpeechInput = {
-    text: body.transcript ?? '',
-    confidence: undefined,  // FreeClimb doesn't provide confidence in TranscribeUtterance
-  };
+    // Build speech input from transcription
+    const input: SpeechInput = {
+      text: body.transcript ?? '',
+      confidence: undefined,  // FreeClimb doesn't provide confidence in TranscribeUtterance
+    };
 
-  // If no transcription, ask to repeat
-  if (!input.text || input.text.trim() === '') {
-    return Response.json([
-      { Say: { text: "I didn't catch that. Could you please repeat?" } },
-      {
-        TranscribeUtterance: {
-          actionUrl: `${new URL(request.url).origin}/conversation`,
-          playBeep: false,
-          record: {
-            maxLengthSec: 25,
-            rcrdTerminationSilenceTimeMs: 4000,
-          },
-        },
-      },
-    ], {
-      headers: { 'Content-Type': 'application/json' },
-    });
-  }
-
-  // V2: streaming path — first sentence TTS'd immediately, rest processed in background
-  if (env.TTS_MODE === 'direct' && ctx && app.streamSpeech) {
-    const origin = new URL(request.url).origin;
-    const callKey = `stream:${context.callId}`;
-
-    try {
-      const sentenceStream = app.streamSpeech(context, input);
-      const { value: sentence1, done: done1 } = await sentenceStream.next();
-
-      const safeSentence1 = sentence1 ? sanitizeForTTS(sentence1) : '';
-
-      if (safeSentence1) {
-        const s1Audio = await callElevenLabs(safeSentence1, env.ELEVENLABS_API_KEY);
-        const s1Id = crypto.randomUUID();
-        await env.RATE_LIMIT_KV.put(`tts:${s1Id}`, s1Audio, { expirationTtl: 120 });
-
-        const transcribeUtterance = {
+    // If no transcription, ask to repeat using a cached Play (same voice as the rest of the call)
+    if (!input.text || input.text.trim() === '') {
+      const origin = new URL(request.url).origin;
+      const retryIdx = Math.floor(Math.random() * RETRY_PHRASES.length);
+      const retryText = RETRY_PHRASES[retryIdx];
+      const retryCacheKey = `retry-${retryIdx}-${VOICE_SLUG}`;
+      let retryAudio = await env.RATE_LIMIT_KV.get(`tts:${retryCacheKey}`, 'arrayBuffer');
+      if (!retryAudio) {
+        retryAudio = await callTTS(retryText, env);
+        await env.RATE_LIMIT_KV.put(`tts:${retryCacheKey}`, retryAudio, { expirationTtl: 6 * 60 * 60 });
+      }
+      return Response.json([
+        { Play: { file: `${origin}/tts-cache?id=${retryCacheKey}` } },
+        {
           TranscribeUtterance: {
             actionUrl: `${origin}/conversation`,
             playBeep: false,
             record: { maxLengthSec: 25, rcrdTerminationSilenceTimeMs: 4000 },
           },
-        };
-
-        if (done1) {
-          // Only one sentence — no redirect needed
-          return Response.json(
-            [{ Play: { file: `${origin}/tts-cache?id=${s1Id}` } }, transcribeUtterance],
-            { headers: { 'Content-Type': 'application/json' } },
-          );
-        }
-
-        // Multiple sentences: return s1 + redirect, process rest in background
-        await env.RATE_LIMIT_KV.put(`${callKey}:1`, s1Id, { expirationTtl: 120 });
-        ctx.waitUntil(processRemainingStream(sentenceStream, callKey, env, 1));
-
-        return Response.json(
-          [
-            { Play: { file: `${origin}/tts-cache?id=${s1Id}` } },
-            { Redirect: { actionUrl: `${origin}/continue?callId=${context.callId}&n=1` } },
-          ],
-          { headers: { 'Content-Type': 'application/json' } },
-        );
-      }
-    } catch (streamErr) {
-      console.error('Streaming path error, falling back to non-streaming:', streamErr);
+        },
+      ], { headers: { 'Content-Type': 'application/json' } });
     }
+
+    // V2: streaming path — first sentence TTS'd immediately, rest processed in background
+    if ((env.TTS_MODE === '11labs' || env.TTS_MODE === 'google') && ctx && app.streamSpeech) {
+      const origin = new URL(request.url).origin;
+      // Per-turn UUID prevents stale KV reads: each conversation turn gets its own
+      // namespace so /continue never picks up sentence-2+ entries from a prior turn.
+      const turnId = crypto.randomUUID();
+      const callKey = `stream:${context.callId}:${turnId}`;
+
+      try {
+        const sentenceStream = app.streamSpeech(context, input);
+        const firstResult = await sentenceStream.next();
+
+        if (!firstResult.done) {
+          const chunk1 = firstResult.value;
+          const safeSentence1 = sanitizeForTTS(chunk1.text);
+
+          if (safeSentence1) {
+            // If the chunk has a stable cache key (filler/goodbye phrase), use cache-first with long TTL.
+            // Otherwise generate fresh audio with a UUID and short TTL.
+            let s1Audio: ArrayBuffer;
+            let s1Id: string;
+            if (chunk1.cacheKey) {
+              s1Id = `${chunk1.cacheKey}-${VOICE_SLUG}`;
+              const cached = await env.RATE_LIMIT_KV.get(`tts:${s1Id}`, 'arrayBuffer');
+              if (cached) {
+                s1Audio = cached;
+              } else {
+                s1Audio = await callTTS(safeSentence1, env);
+                await env.RATE_LIMIT_KV.put(`tts:${s1Id}`, s1Audio, { expirationTtl: 6 * 60 * 60 });
+              }
+            } else {
+              s1Id = crypto.randomUUID();
+              s1Audio = await callTTS(safeSentence1, env);
+              await env.RATE_LIMIT_KV.put(`tts:${s1Id}`, s1Audio, { expirationTtl: 120 });
+            }
+
+            if (chunk1.hangup) {
+              // Generator signaled hangup — brief pause so goodbye doesn't cut off abruptly
+              return Response.json(
+                [{ Play: { file: `${origin}/tts-cache?id=${s1Id}` } }, { Pause: { length: 300 } }, { Hangup: {} }],
+                { headers: { 'Content-Type': 'application/json' } },
+              );
+            }
+
+            // Queue remaining sentences in background and start redirect chain.
+            // /continue handles the case where there are no more sentences (returns TranscribeUtterance).
+            await env.RATE_LIMIT_KV.put(`${callKey}:1`, s1Id, { expirationTtl: 120 });
+            ctx.waitUntil(processRemainingStream(sentenceStream, callKey, env, 1));
+
+            return Response.json(
+              [
+                { Play: { file: `${origin}/tts-cache?id=${s1Id}` } },
+                { Redirect: { actionUrl: `${origin}/continue?callId=${context.callId}&turn=${turnId}&n=1` } },
+              ],
+              { headers: { 'Content-Type': 'application/json' } },
+            );
+          }
+        }
+      } catch (streamErr) {
+        console.error('Streaming path error, falling back to non-streaming:', streamErr);
+      }
+    }
+
+    // Standard (non-streaming) path
+    const response = await app.onSpeech(context, input);
+
+    // Convert to PerCL
+    const percl = await buildPerCL(response, request.url, getTTSProvider(env));
+
+    return Response.json(percl, {
+      headers: { 'Content-Type': 'application/json' },
+    });
+  } catch (error) {
+    console.error('Error in handleConversation:', error instanceof Error ? error.stack : String(error));
+    return Response.json([
+      { Say: { text: 'Sorry, an error occurred. Please try again.' } },
+      { Hangup: {} },
+    ], { status: 500 });
   }
-
-  // Standard (non-streaming) path
-  const response = await app.onSpeech(context, input);
-
-  // Convert to PerCL
-  const percl = await buildPerCL(response, request.url, getTTSProvider(env));
-
-  return Response.json(percl, {
-    headers: { 'Content-Type': 'application/json' },
-  });
 }
 
 /**

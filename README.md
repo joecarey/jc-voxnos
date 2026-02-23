@@ -1,28 +1,32 @@
 # jc-voxnos
 
-> **Part of the [platform](https://github.com/joecarey/platform) ecosystem** | See [Platform Overview](https://github.com/joecarey/platform/blob/main/docs/PLATFORM-OVERVIEW.md) for architecture
+> **Part of the [Ava platform](https://github.com/joecarey/platform)** | See [Platform Overview](https://github.com/joecarey/platform/blob/main/docs/PLATFORM-OVERVIEW.md)
 
-Voice interaction framework for building speech-enabled applications using FreeClimb API.
+Multi-app voice platform for building speech-enabled applications using FreeClimb telephony and Claude AI.
 
-## Concept
+## What It Does
 
-Voxnos is a **platform**, not a single IVR. It lets you build multiple **apps** that handle phone calls using:
-- **Speech input** - Transcription instead of DTMF keypad
-- **Speech output** - Text-to-speech synthesis
-- **Conversational flow** - Open-ended dialogues, not just menus
+Voxnos handles inbound phone calls. Each call routes to a registered **app** that controls the conversation. The platform provides shared infrastructure: FreeClimb webhook auth, Claude orchestration, tool execution, and TTS synthesis.
+
+**Default app**: Claude assistant with weather and knowledge base (cognos) tools, streaming Google Chirp 3 HD TTS.
 
 ## Architecture
 
 ```
-Phone Call → FreeClimb → Voxnos Platform → App Router → Your App
-                                 ↓
-                            Speech I/O Layer
-                         (Transcription + TTS)
+Phone Call → FreeClimb → POST /call
+                              ↓
+                         App Router
+                              ↓
+                    app.onStart() / app.onSpeech()
+                              ↓
+                    Claude + Tools → streamSpeech()
+                              ↓
+                    Google TTS → KV → Play commands
 ```
 
 ## Building an App
 
-Apps implement the `VoxnosApp` interface:
+Implement `VoxnosApp` and register it:
 
 ```typescript
 import type { VoxnosApp, AppContext, SpeechInput, AppResponse } from './core/types.js';
@@ -31,124 +35,57 @@ export class MyApp implements VoxnosApp {
   id = 'my-app';
   name = 'My Voice App';
 
-  // Called when call starts
   async onStart(context: AppContext): Promise<AppResponse> {
-    return {
-      speech: { text: 'Welcome! How can I help you?' },
-      prompt: true,  // Listen for caller's response
-    };
+    return { speech: { text: 'Welcome!' }, prompt: true };
   }
 
-  // Called when caller speaks
   async onSpeech(context: AppContext, input: SpeechInput): Promise<AppResponse> {
-    // Process input.text (transcribed speech)
-    // Return response
-    return {
-      speech: { text: `You said: ${input.text}` },
-      prompt: true,   // Keep listening
-      hangup: false,  // Don't hang up yet
-    };
-  }
-
-  // Optional: Called when call ends
-  async onEnd(context: AppContext): Promise<void> {
-    console.log('Call ended');
+    return { speech: { text: `You said: ${input.text}` }, prompt: true };
   }
 }
 ```
 
-Register your app in `src/index.ts`:
-
+Register in `src/index.ts`:
 ```typescript
-import { MyApp } from './apps/my-app.js';
-registry.register(new MyApp(), true);  // true = default app
+registry.register(new MyApp(), true); // true = default app
 ```
-
-## Included Apps
-
-- **Echo App** (`src/apps/echo.ts`) - Simple demo that repeats what you say
 
 ## Stack
 
-- **Cloudflare Workers** - Serverless hosting
-- **FreeClimb API** - Telephony platform
-  - `RecordUtterance` - Speech transcription
-  - `Say` - Text-to-speech
-- **TypeScript** - Type-safe development
-- **Supabase** - Database (for sessions, logs, config)
+- **Cloudflare Workers** — serverless hosting
+- **FreeClimb** — telephony (call routing, transcription, audio playback)
+- **Anthropic Claude** — AI assistant (Claude Sonnet)
+- **Google Chirp 3 HD** — TTS (`en-US-Chirp3-HD-Despina`)
+- **Supabase** — conversation history storage
 
-## Setup
+## Endpoints
 
-### 1. Install dependencies
-
-```bash
-npm install
-```
-
-### 2. Configure FreeClimb
-
-1. Sign up at https://www.freeclimb.com/
-2. Get Account ID and API Key
-3. Purchase a phone number
-4. Configure phone number:
-   - **Voice URL**: `https://jc-voxnos.YOUR_SUBDOMAIN.workers.dev/voice`
-
-### 3. Set environment variables
-
-```bash
-npx wrangler secret put SUPABASE_URL
-npx wrangler secret put SUPABASE_SERVICE_ROLE_KEY
-npx wrangler secret put FREECLIMB_ACCOUNT_ID
-npx wrangler secret put FREECLIMB_API_KEY
-```
-
-### 4. Deploy
-
-```bash
-npm run deploy
-```
+| Endpoint | Auth | Description |
+|----------|------|-------------|
+| `POST /call` | FreeClimb sig | Incoming call webhook |
+| `POST /conversation` | FreeClimb sig | Each speech turn |
+| `GET /tts` | HMAC sig | On-demand TTS synthesis |
+| `GET /tts-cache` | none | Pre-generated audio (KV-backed) |
+| `GET /continue` | none | Streaming sentence redirect chain |
+| `GET /` | none | Health check |
+| `GET /apps` | none | List registered apps |
+| `GET /logs` | admin | FreeClimb call logs |
+| `GET /costs` | admin | 14-day Anthropic token usage |
 
 ## Development
 
 ```bash
+npm install
 npm run dev
-```
-
-For local testing with FreeClimb, expose via tunnel:
-
-```bash
 cloudflared tunnel --url http://localhost:8787
 ```
 
-Update FreeClimb phone number voice URL to tunnel URL.
+Update FreeClimb phone number voice URL to the tunnel URL.
 
-## API Endpoints
+## Deploy
 
-- `GET /` - Health check
-- `GET /apps` - List registered apps
-- `POST /voice` - FreeClimb incoming call webhook
-- `POST /transcription` - FreeClimb transcription webhook
+```bash
+npm run deploy  # or: npx wrangler deploy
+```
 
-## Use Cases
-
-- **Voice assistants** - Conversational AI with Claude API
-- **Surveys** - Collect feedback via voice
-- **Appointment scheduling** - Book/modify appointments
-- **Information hotlines** - Answer questions
-- **Call routing** - Intelligent call distribution
-- **Voicemail** - Custom voicemail systems
-
-## Next Steps
-
-- [ ] Add database schema for sessions/messages
-- [ ] Implement session state management
-- [ ] Create Claude API integration app
-- [ ] Add analytics/logging
-- [ ] Phone number → app mapping in database
-- [ ] Build admin dashboard
-
-## Documentation
-
-- [FreeClimb RecordUtterance](https://docs.freeclimb.com/reference/recordutterance)
-- [FreeClimb Say](https://docs.freeclimb.com/reference/say-1)
-- [PerCL Overview](https://docs.freeclimb.com/reference/percl-overview)
+CI/CD: GitHub Actions auto-deploys on push to `master`.

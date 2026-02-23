@@ -7,5 +7,5 @@ compatibility_flags = ["nodejs_compat"]
 binding = "RATE_LIMIT_KV"
 id = "58a6ac9954ea44d2972ba2cb9e1e077e"
 
-[env.production]
-name = "jc-voxnos"
+[vars]
+TTS_MODE = "google"

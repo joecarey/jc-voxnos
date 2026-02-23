@@ -24,6 +24,7 @@ export interface PerCLCommand {
       rcrdTerminationSilenceTimeMs: number;
     };
   };
+  Pause?: { length: number };
   Hangup?: Record<string, never>;
   OutDial?: {
     destination: string;
@@ -120,8 +121,9 @@ export async function buildPerCL(
     });
   }
 
-  // Hang up if requested
+  // Hang up if requested — brief pause first so the goodbye phrase doesn't cut off abruptly
   if (response.hangup) {
+    percl.push({ Pause: { length: 300 } });
     percl.push({ Hangup: {} });
   }
 

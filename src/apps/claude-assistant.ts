@@ -1,6 +1,6 @@
 // Claude-powered voice assistant app with tool support
 
-import type { VoxnosApp, AppContext, SpeechInput, AppResponse } from '../core/types.js';
+import type { VoxnosApp, AppContext, SpeechInput, AppResponse, StreamChunk } from '../core/types.js';
 import { toolRegistry } from '../tools/registry.js';
 
 // Retryable HTTP status codes for Anthropic API calls
@@ -62,17 +62,38 @@ function extractCompleteSentences(buffer: string): { complete: string[]; remaind
   return { complete: sentences, remainder: buffer.slice(last) };
 }
 
-// Simple in-memory conversation storage with TTL
-const CONVERSATION_TTL_MS = 5 * 60 * 1000; // 5 minutes
-const conversations = new Map<string, { messages: Message[]; lastActive: number }>();
+// Phrases used for tool-call acknowledgments — randomized so repeat callers don't hear the same line
+export const FILLER_PHRASES = [
+  'One moment while I check on that.',
+  'Let me look that up for you.',
+  'Sure, let me find that information.',
+  'Just a second while I pull that up.',
+  'Hold on while I check on that.',
+  'Let me get that for you.',
+];
 
-function pruneConversations(): void {
-  const now = Date.now();
-  for (const [id, data] of conversations.entries()) {
-    if (now - data.lastActive > CONVERSATION_TTL_MS) {
-      conversations.delete(id);
-    }
-  }
+// Goodbye phrases — randomized for variety
+export const GOODBYE_PHRASES = [
+  'Goodbye! Have a great day.',
+  'Great talking with you. Talk to you soon!',
+  'It was great chatting with you. Goodbye!',
+  'Hope I was helpful. Have a wonderful day!',
+  'Goodbye! Feel free to call back anytime.',
+  "Sure thing. I'm here if you need me.",
+];
+
+// Conversation storage via KV — reliable across Cloudflare Worker isolates.
+// In-memory Maps are scoped to a single isolate; KV is consistent regardless of which
+// isolate handles a given request, so context is never lost between call turns.
+const CONVERSATION_TTL_SECONDS = 15 * 60; // 15 minutes — longer than any realistic call
+
+async function getMessages(kv: KVNamespace, callId: string): Promise<Message[]> {
+  const data = await kv.get(`conv:${callId}`, 'json') as Message[] | null;
+  return data ?? [];
+}
+
+async function saveMessages(kv: KVNamespace, callId: string, messages: Message[]): Promise<void> {
+  await kv.put(`conv:${callId}`, JSON.stringify(messages), { expirationTtl: CONVERSATION_TTL_SECONDS });
 }
 
 export class ClaudeAssistant implements VoxnosApp {
@@ -80,9 +101,6 @@ export class ClaudeAssistant implements VoxnosApp {
   name = 'Claude Voice Assistant';
 
   async onStart(context: AppContext): Promise<AppResponse> {
-    pruneConversations();
-    conversations.set(context.callId, { messages: [], lastActive: Date.now() });
-
     console.log(JSON.stringify({
       event: 'call_start',
       callId: context.callId,
@@ -104,29 +122,19 @@ export class ClaudeAssistant implements VoxnosApp {
 
     // Check for goodbye intent
     if (this.isGoodbye(userMessage)) {
+      const goodbye = GOODBYE_PHRASES[Math.floor(Math.random() * GOODBYE_PHRASES.length)];
       return {
-        speech: {
-          text: 'Goodbye! Have a great day.',
-        },
+        speech: { text: goodbye },
         hangup: true,
       };
     }
 
-    // Get conversation history
-    const entry = conversations.get(context.callId);
-    const messages = entry?.messages ?? [];
+    const messages = await getMessages(context.env.RATE_LIMIT_KV, context.callId);
+    messages.push({ role: 'user', content: userMessage });
 
-    // Add user message to history
-    messages.push({
-      role: 'user',
-      content: userMessage,
-    });
-
-    // Call Claude API (with tool support)
     const assistantResponse = await this.callClaude(context, messages);
 
-    // Update conversation with refreshed timestamp
-    conversations.set(context.callId, { messages, lastActive: Date.now() });
+    await saveMessages(context.env.RATE_LIMIT_KV, context.callId, messages);
 
     return {
       speech: {
@@ -137,7 +145,7 @@ export class ClaudeAssistant implements VoxnosApp {
   }
 
   async onEnd(context: AppContext): Promise<void> {
-    conversations.delete(context.callId);
+    await context.env.RATE_LIMIT_KV.delete(`conv:${context.callId}`);
     console.log(JSON.stringify({
       event: 'call_end',
       callId: context.callId,
@@ -151,21 +159,29 @@ export class ClaudeAssistant implements VoxnosApp {
    * Sentences are yielded immediately upon detection of a sentence boundary, enabling
    * routes.ts to TTS sentence 1 and return to FreeClimb before sentences 2+ are ready.
    */
-  async *streamSpeech(context: AppContext, input: SpeechInput): AsyncGenerator<string, void, undefined> {
+  async *streamSpeech(context: AppContext, input: SpeechInput): AsyncGenerator<StreamChunk, void, undefined> {
     const userMessage = input.text.trim();
 
     if (this.isGoodbye(userMessage)) {
-      yield 'Goodbye! Have a great day.';
+      const idx = Math.floor(Math.random() * GOODBYE_PHRASES.length);
+      yield { text: GOODBYE_PHRASES[idx], hangup: true, cacheKey: `goodbye-${idx}` };
       return;
     }
 
-    const entry = conversations.get(context.callId);
-    const messages: Message[] = entry ? [...entry.messages] : [];
+    const messages = await getMessages(context.env.RATE_LIMIT_KV, context.callId);
     messages.push({ role: 'user', content: userMessage });
 
-    yield* this.streamClaude(context, messages);
+    for await (const sentence of this.streamClaude(context, messages)) {
+      // Filler phrases have stable cache keys so routes.ts can serve them without re-generating TTS
+      const fillerIdx = FILLER_PHRASES.indexOf(sentence);
+      if (fillerIdx >= 0) {
+        yield { text: sentence, cacheKey: `filler-${fillerIdx}` };
+      } else {
+        yield { text: sentence };
+      }
+    }
 
-    conversations.set(context.callId, { messages, lastActive: Date.now() });
+    await saveMessages(context.env.RATE_LIMIT_KV, context.callId, messages);
   }
 
   /**
@@ -175,12 +191,14 @@ export class ClaudeAssistant implements VoxnosApp {
    */
   private async *streamClaude(context: AppContext, messages: Message[]): AsyncGenerator<string, void, undefined> {
     const systemPrompt = `You are a helpful voice assistant. Your responses will be converted to speech, so:
-- Keep responses concise (2-3 sentences max)
+- Keep responses concise (1-2 sentences for simple answers, 3 max for complex ones)
 - Use natural, conversational language
 - Avoid special characters, URLs, or formatting
 - If asked complex questions, summarize briefly and offer to elaborate
 - Be friendly and helpful
-- When using tools, explain what you found in a natural way`;
+- When using tools, state the result once clearly — do not restate or paraphrase the same fact
+- Never repeat information you already said in a different form
+- Always use tools to fetch real-time data (weather, stocks, etc.) — even for follow-up questions about different locations or topics; never answer from training data when a tool is available`;
 
     let totalInputTokens = 0;
     let totalOutputTokens = 0;
@@ -262,6 +280,13 @@ export class ClaudeAssistant implements VoxnosApp {
                 currentToolId = event.content_block.id ?? '';
                 currentToolName = event.content_block.name ?? '';
                 currentToolInputJson = '';
+                // Yield filler immediately — we know a tool is coming before the stream finishes.
+                // This fires ~300-600ms sooner than waiting for the full tool_use JSON to stream.
+                if (yieldedSentences.length === 0) {
+                  const filler = FILLER_PHRASES[Math.floor(Math.random() * FILLER_PHRASES.length)];
+                  yield filler;
+                  yieldedSentences.push(filler);
+                }
               }
               break;
 
@@ -305,6 +330,7 @@ export class ClaudeAssistant implements VoxnosApp {
 
       if (hasToolUse) {
         // Build assistant content (optional leading text + tool_use blocks)
+        // Note: filler was already yielded at content_block_start above
         const assistantContent: ContentBlock[] = [
           ...(yieldedSentences.length > 0 ? [{ type: 'text' as const, text: yieldedSentences.join(' ') }] : []),
           ...toolUseBlocks.map(t => ({
@@ -355,12 +381,14 @@ export class ClaudeAssistant implements VoxnosApp {
 
   private async callClaude(context: AppContext, history: Message[]): Promise<string> {
     const systemPrompt = `You are a helpful voice assistant. Your responses will be converted to speech, so:
-- Keep responses concise (2-3 sentences max)
+- Keep responses concise (1-2 sentences for simple answers, 3 max for complex ones)
 - Use natural, conversational language
 - Avoid special characters, URLs, or formatting
 - If asked complex questions, summarize briefly and offer to elaborate
 - Be friendly and helpful
-- When using tools, explain what you found in a natural way`;
+- When using tools, state the result once clearly — do not restate or paraphrase the same fact
+- Never repeat information you already said in a different form
+- Always use tools to fetch real-time data (weather, stocks, etc.) — even for follow-up questions about different locations or topics; never answer from training data when a tool is available`;
 
     try {
       let continueLoop = true;
