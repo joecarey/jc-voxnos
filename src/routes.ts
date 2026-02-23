@@ -171,6 +171,11 @@ async function processRemainingStream(
   startIndex: number,
   opts?: { skipFillers?: boolean; onHangup?: () => Promise<void> },
 ): Promise<void> {
+  // Signal /continue that the stream is alive — without this marker, /continue
+  // can't distinguish "stream hasn't produced anything yet" from "stream is done"
+  // and may return TranscribeUtterance prematurely (e.g. during slow cognos calls).
+  await env.RATE_LIMIT_KV.put(`${callKey}:pending`, '1', { expirationTtl: 120 });
+
   let n = startIndex;
   try {
     for await (const chunk of sentenceStream) {

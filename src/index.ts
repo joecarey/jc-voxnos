@@ -248,19 +248,26 @@ export default {
       const nextN = n + 1;
       const origin = new URL(request.url).origin;
 
-      // Poll for background TTS to finish. Use short intervals to minimise
-      // dead air but stay well under FreeClimb's webhook response timeout (~15s).
-      // 15 × 500ms = 7.5s max; Cognos briefs take ~3-8s so this is usually enough.
+      // Poll for background TTS to finish. Keeps polling as long as the stream
+      // is still alive (`:pending` marker set by processRemainingStream on entry).
+      // Max 25 × 500ms = 12.5s; exits early on `:done` or when sentence is found.
+      // Tool-heavy turns (cognos briefs) need ~8-12s total so we must not bail early.
       const pollStart = Date.now();
       let nextId: string | null = null;
       let pollAttempts = 0;
-      for (let attempt = 0; attempt < 15; attempt++) {
+      for (let attempt = 0; attempt < 25; attempt++) {
         if (attempt > 0) await new Promise(r => setTimeout(r, 500));
         pollAttempts = attempt + 1;
         nextId = await env.RATE_LIMIT_KV.get(`${callKey}:${nextN}`);
         if (nextId) break;
         const done = await env.RATE_LIMIT_KV.get(`${callKey}:done`);
         if (done) break;
+        // If no :pending marker exists, the stream never started or already finished
+        // without writing :done — no point waiting further.
+        if (attempt > 0) {
+          const pending = await env.RATE_LIMIT_KV.get(`${callKey}:pending`);
+          if (!pending) break;
+        }
       }
       console.log(JSON.stringify({ event: 'continue_poll', callId, n, nextN, found: !!nextId, attempts: pollAttempts, elapsed_ms: Date.now() - pollStart }));
 

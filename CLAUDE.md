@@ -45,7 +45,7 @@ Multi-app voice platform: FreeClimb telephony + Claude Sonnet 4.6 + Google Chirp
 2. **Pre-filler path** (50% coin flip, non-goodbye): cached filler ("On it.", "One sec.") played immediately → full stream runs in background → `/continue` picks up real sentences. Skips app-yielded fillers to prevent double-filler.
 3. **Standard path** (other 50% or no fillerPhrases): first sentence TTS'd immediately → KV → `Play` + `Redirect` to `/continue`
 4. Remaining: background via `ctx.waitUntil()`, stored in KV with per-turn UUID
-5. `/continue` polls KV (25×500ms, ~12.5s max) → `Play+Redirect`, `Play+Pause+Hangup` (hangup marker), or `TranscribeUtterance`
+5. `/continue` polls KV (25×500ms, ~12.5s max); keeps polling while `:pending` marker exists, exits early on `:done` → `Play+Redirect`, `Play+Pause+Hangup` (hangup marker), or `TranscribeUtterance`
 6. **Hangup-via-KV**: `processRemainingStream` detects hangup chunks, writes `{callKey}:hangup` marker, `/continue` returns Hangup instead of Redirect
 
 ## KV Schema (RATE_LIMIT_KV)
@@ -55,6 +55,7 @@ Multi-app voice platform: FreeClimb telephony + Claude Sonnet 4.6 + Google Chirp
 | `tts:{stable-key}-{VOICE_SLUG}` | audio ArrayBuffer | 6hr | greetings, fillers, retry phrases |
 | `tts:{uuid}` | audio ArrayBuffer | 120s | per-sentence streaming audio |
 | `stream:{callId}:{turnId}:{n}` | UUID string | 120s | sentence index pointer |
+| `stream:{callId}:{turnId}:pending` | `'1'` | 120s | stream-alive signal (written on entry) |
 | `stream:{callId}:{turnId}:done` | `'1'` | 120s | stream completion signal |
 | `stream:{callId}:{turnId}:hangup` | sentence index string | 120s | hangup marker for /continue |
 | `conv:{callId}` | JSON messages | 15min | conversation history |
@@ -69,7 +70,7 @@ Multi-app voice platform: FreeClimb telephony + Claude Sonnet 4.6 + Google Chirp
 - Keep `voiceSlug(env)` appended to all stable TTS cache keys
 - Keep `Cache-Control: no-store` on all `/tts-cache` responses
 - Pre-filler path must skip app-yielded fillers (`skipFillers`) to prevent double-filler
-- `processRemainingStream` must write hangup marker and fire `onHangup` on hangup chunks
+- `processRemainingStream` must write `:pending` on entry, hangup marker on hangup chunks, and fire `onHangup`
 
 ## Cognos Dependency
 
@@ -110,6 +111,16 @@ ELEVENLABS_API_KEY    # required when TTS_MODE=11labs
 ## Ava Platform Context
 
 Voice node of the Ava platform. Upstream: `jc-cognos` via `POST /brief`. Telephony: FreeClimb. Global constraints: Cloudflare free tier, KV ~30 writes/5-turn call. Full topology: `../platform/mesh/AVA-MAP.md`.
+
+## Debugging & Logs
+
+**"Check recent logs"** → run `./scripts/logs.sh` (most recent call timeline) or `./scripts/logs.sh <callId>`.
+- `./scripts/logs.sh --raw` → raw FreeClimb JSON (pipe to `jq`)
+- `./scripts/logs.sh --tail` → live Cloudflare Worker `console.log` output (ctrl-c to stop)
+- Admin API key is read from `.dev.vars`, base URL is `https://jc-voxnos.cloudflare-5cf.workers.dev`
+- Worker logs (`console.log`) emit structured JSON events: `call_incoming`, `conversation_turn`, `pre_filler`, `continue_poll`, `no_input`, `claude_stream_complete`, `tool_execute`, `call_end`
+- FreeClimb logs (via `GET /logs`) show request/response bodies for every webhook exchange
+- `rcrdTerminationSilenceTimeMs` max is 3000 (FreeClimb SDK ceiling)
 
 ## Deployment
 
