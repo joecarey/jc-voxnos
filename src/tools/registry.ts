@@ -19,6 +19,20 @@ class ToolRegistry {
     return Array.from(this.tools.values()).map(tool => tool.definition);
   }
 
+  /** Return definitions for only the named tools. Unknown names are skipped with a warning. */
+  getDefinitionsFor(names: string[]): ToolDefinition[] {
+    const defs: ToolDefinition[] = [];
+    for (const name of names) {
+      const tool = this.tools.get(name);
+      if (tool) {
+        defs.push(tool.definition);
+      } else {
+        console.warn(`ToolRegistry: unknown tool name "${name}"`);
+      }
+    }
+    return defs;
+  }
+
   async execute(name: string, input: Record<string, any>): Promise<string> {
     const tool = this.get(name);
     if (!tool) {

@@ -10,9 +10,9 @@ Multi-app voice platform: FreeClimb telephony + Claude Sonnet 4.6 + Google Chirp
 - `src/index.ts` — entry point, HTTP router, admin endpoints
 - `src/engine/` — conversation engine + app framework (types, engine, base-app, conversational-app, survey-app, registry, speech-utils)
 - `src/telephony/` — FreeClimb adapter (routes, percl)
-- `src/services/` — shared clients (claude-client, conversation, survey-store)
+- `src/services/` — shared clients (claude-client, conversation, survey-store, app-store, cdr-store)
 - `src/platform/` — HTTP infrastructure (auth, webhook-auth, rate-limit, env)
-- `src/apps/` — concrete app instances (ava, rita, coco, otto, echo)
+- `src/apps/` — concrete app instances (ava, rita, otto, echo)
 - `src/tts/` — TTS providers (google, elevenlabs, freeclimb, helpers, streaming)
 - `src/tools/` — tool system (registry, weather, cognos)
 
@@ -22,19 +22,28 @@ Multi-app voice platform: FreeClimb telephony + Claude Sonnet 4.6 + Google Chirp
 VoxnosApp (interface — platform contract)
 ├── BaseApp (abstract — logging, KV cleanup)
 │   ├── ConversationalApp (LLM turn cycle: Claude + history + streaming)
-│   │   ├── Ava, Rita
+│   │   └── (D1-driven — Ava, Rita, etc.)
 │   └── SurveyApp (scripted Q&A: sequential questions, typed answer parsing)
-│       └── Coco
+│       └── (D1-driven — Coco, etc.)
 └── EchoApp (implements VoxnosApp directly)
 ```
 
 ## Registered Apps
 
+### Static (code-defined)
 - `EchoApp` — demo only, implements VoxnosApp directly
 - `OttoAssistant` — dormant snapshot of pre-Ava assistant (2026-02-23); not routed to any FreeClimb number
-- `RitaAssistant` — ConversationalApp, neutral/professional personality. Not routed to a phone number.
-- `CocoSurvey` — SurveyApp, 3-question CX demo (satisfaction scale, recommend yes/no, open feedback). Not routed to a phone number.
-- `AvaAssistant` — **default** — ConversationalApp, Claude Sonnet 4.6, tools (weather + cognos), streaming TTS, KV conversation history. Warm/familiar personality ("Ava"), informal greetings, short fillers, concise goodbyes.
+
+### Dynamic (D1-driven — `app_definitions` table)
+Loaded from `app_definitions` table at Worker startup. Each active row becomes a `ConversationalApp` or `SurveyApp` instance registered with `{ dynamic: true }`. Managed via `POST /apps/definitions`, `DELETE /apps/definitions/:id`, `POST /reload-apps`.
+- `ava` — **default** — ConversationalApp, Claude Sonnet 4.6, tools (weather + cognos), streaming TTS. Warm/familiar personality, informal greetings, short fillers.
+- `rita` — ConversationalApp, neutral/professional personality, tools (weather + cognos).
+- `coco` — SurveyApp, 3-question CX demo (satisfaction/scale, recommend/yes_no, feedback/open)
+
+**Fallback**: if D1 is unavailable at startup, code-defined `AvaAssistant` and `RitaAssistant` (`src/apps/ava.ts`, `src/apps/rita.ts`) are registered instead.
+
+### Phone Routing
+`phone_routes` table maps phone numbers (E.164) to app IDs. Loaded at startup. `registry.getForNumber()` checks routes first, falls back to the default app. Managed via `POST /phone-routes`, `DELETE /phone-routes/:phoneNumber`.
 
 ## HTTP Endpoints
 
@@ -52,6 +61,16 @@ VoxnosApp (interface — platform contract)
 - `GET /logs` — FreeClimb call logs, `GET /costs` — 14-day Anthropic token usage
 - `GET /survey-results?survey=coco&from=2026-02-01&to=2026-02-28&limit=50&offset=0` — list survey results (all params optional)
 - `GET /survey-results/:id` — single survey result by ID
+- `GET /apps/definitions` — list all app definitions (active + inactive)
+- `GET /apps/definitions/:id` — single app definition by ID
+- `POST /apps/definitions` — create/update an app definition (validates per type, registers in-memory immediately)
+- `DELETE /apps/definitions/:id` — soft-delete app definition + remove from in-memory registry
+- `GET /phone-routes` — list all phone number → app routes
+- `POST /phone-routes` — create/update a phone route (`{ phone_number, app_id, label? }`)
+- `DELETE /phone-routes/:phoneNumber` — delete a phone route
+- `POST /reload-apps` — force re-read all definitions and routes from D1
+- `GET /cdr?app_id=ava&from=2026-02-01&to=2026-02-28&caller=+1...&limit=50&offset=0` — list call detail records (all params optional)
+- `GET /cdr/:callId` — single CDR with full turn-by-turn detail
 
 ### Public
 - `GET /` — health check, `GET /apps` — list registered apps
@@ -90,6 +109,8 @@ VoxnosApp (interface — platform contract)
 
 ## D1 Schema (DB — jc-voxnos-surveys)
 
+### `survey_results` table
+
 | Column | Type | Notes |
 |---|---|---|
 | `id` | INTEGER | Primary key, autoincrement |
@@ -101,6 +122,72 @@ VoxnosApp (interface — platform contract)
 | `summary` | TEXT NOT NULL | Claude-generated 2-3 sentence summary |
 
 SurveyApp writes to D1 on completion. Falls back to KV (`survey-results:{callId}`, 24hr TTL) if D1 binding is absent.
+
+### `app_definitions` table
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | TEXT | Primary key (app ID, e.g. "ava", "coco") |
+| `name` | TEXT NOT NULL | Display name |
+| `type` | TEXT NOT NULL | `conversational` or `survey` |
+| `config` | TEXT NOT NULL | JSON blob — shape depends on `type` (see below) |
+| `active` | INTEGER NOT NULL | 1 = active, 0 = soft-deleted (default 1) |
+| `is_default` | INTEGER NOT NULL | 1 = default app for unrouted calls (default 0) |
+| `created_at` | TEXT NOT NULL | ISO 8601 (default `datetime('now')`) |
+| `updated_at` | TEXT NOT NULL | ISO 8601 (default `datetime('now')`) |
+
+**Conversational config**: `{ systemPrompt, greetings[], fillers[], goodbyes[], retries?[], model?, tools?[] }`. `tools` is an array of tool name strings resolved against `ToolRegistry` at startup.
+
+**Survey config**: `{ greeting, closing, questions[{label,text,type}], retries?[] }`.
+
+Active definitions are loaded into memory at Worker startup. CRUD via admin endpoints (`/apps/definitions`).
+
+### `phone_routes` table
+
+| Column | Type | Notes |
+|---|---|---|
+| `phone_number` | TEXT | Primary key (E.164 format) |
+| `app_id` | TEXT NOT NULL | References `app_definitions.id` |
+| `label` | TEXT | Optional human-readable label |
+| `created_at` | TEXT NOT NULL | ISO 8601 (default `datetime('now')`) |
+| `updated_at` | TEXT NOT NULL | ISO 8601 (default `datetime('now')`) |
+
+Loaded at startup into `registry.phoneRoutes`. CRUD via admin endpoints (`/phone-routes`).
+
+### `call_records` table (CDR)
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | INTEGER | Primary key, autoincrement |
+| `call_id` | TEXT NOT NULL UNIQUE | FreeClimb call ID |
+| `app_id` | TEXT NOT NULL | App that handled the call — indexed |
+| `caller` | TEXT NOT NULL | Caller phone number |
+| `callee` | TEXT NOT NULL | Called phone number |
+| `started_at` | TEXT NOT NULL | ISO 8601 — indexed |
+| `ended_at` | TEXT | ISO 8601 (set on finalization) |
+| `duration_ms` | INTEGER | Computed from `started_at` → `ended_at` |
+| `outcome` | TEXT NOT NULL | `in_progress`, `completed`, `no_response`, `error` |
+| `turn_count` | INTEGER NOT NULL | Counted from `call_turns` at finalization |
+| `total_input_tokens` | INTEGER NOT NULL | Accumulated Claude input tokens |
+| `total_output_tokens` | INTEGER NOT NULL | Accumulated Claude output tokens |
+
+Written at call start (`createCallRecord`), finalized at hangup/goodbye (`endCallRecord`). Fire-and-forget — never blocks the call.
+
+### `call_turns` table (CDR)
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | INTEGER | Primary key, autoincrement |
+| `call_id` | TEXT NOT NULL | References `call_records.call_id` — indexed |
+| `seq` | INTEGER NOT NULL | Auto-assigned sequence within the call (UNIQUE with call_id) |
+| `turn_type` | TEXT NOT NULL | See turn types below |
+| `speaker` | TEXT NOT NULL | `caller` or `system` |
+| `content` | TEXT | The actual text spoken (transcript or TTS text) |
+| `meta` | TEXT | Optional JSON blob for structured data |
+
+**Turn types**: `greeting` (system greeting), `caller_speech` (transcribed input), `assistant_response` (Claude's full text reply, all sentences joined), `filler` (acknowledgment phrase), `no_input` (caller said nothing, retry played), `goodbye` (farewell, call ending), `tool_use`, `error`.
+
+CDR turns are written fire-and-forget at each event point in the route handler. Streaming responses are collected via `onStreamComplete` callback and written as a single `assistant_response` turn when the stream finishes.
 
 ## Invariants
 
@@ -135,16 +222,18 @@ Routes pattern-match on `TurnResult.type` to produce FreeClimb PerCL + TTS. The 
 - **`types.ts`** — `Env`, `AppContext`, `SpeechInput`, `AppResponse`, `StreamChunk`, `VoxnosApp` interface.
 - **`engine.ts`** — Conversation engine. `processTurn()`, `TurnResult` type, `DEFAULT_RETRY_PHRASES`. Decides no-input/streaming/pre-filler per turn.
 - **`base-app.ts`** — `BaseApp` abstract class implementing `VoxnosApp`. Handles call lifecycle logging (`call_start`/`call_end`), KV cleanup in `onEnd`. Exposes `fillerPhrases` and `retryPhrases`. Subclasses implement `getGreeting()` and `onSpeech()`.
-- **`conversational-app.ts`** — `ConversationalApp extends BaseApp`. LLM-conversational pattern: goodbye detection, conversation history, Claude delegation, streaming with filler tagging. Configured via `AssistantConfig` (id, name, systemPrompt, greetings, fillers, goodbyes, retries, model).
+- **`conversational-app.ts`** — `ConversationalApp extends BaseApp`. LLM-conversational pattern: goodbye detection, conversation history, Claude delegation, streaming with filler tagging. Configured via `AssistantConfig` (id, name, systemPrompt, greetings, fillers, goodbyes, retries, model, tools). `tools` is an optional string array of tool names — when set, only those tools are sent to Claude (per-app filtering).
 - **`survey-app.ts`** — `SurveyApp extends BaseApp`. Scripted Q&A: sequential questions, typed answer parsing, Claude-generated summary. Configured via `SurveyConfig` (id, name, greeting, closing, questions, retries).
-- **`registry.ts`** — `AppRegistry` singleton. Maps app IDs to instances, resolves phone numbers to apps.
+- **`registry.ts`** — `AppRegistry` singleton. Maps app IDs to instances (with `dynamic` flag for D1-loaded apps), resolves phone numbers to apps via `phoneRoutes` map. `register(app, opts?)` accepts `{ isDefault?, dynamic? }`. `getForNumber(phone)` checks `phoneRoutes` first, falls back to `defaultApp`. `setPhoneRoute(phone, appId)` / `removePhoneRoute(phone)` / `clearPhoneRoutes()` manage routing. `removeDynamic()` clears all D1-loaded entries, phone routes, and default for clean reload. `remove(appId)` removes a single entry.
 - **`speech-utils.ts`** — `fetchWithRetry()`, `extractCompleteSentences()`, `isGoodbye()`. Pure functions. `isGoodbye` is the single source of truth (used by engine and apps).
 
 ## Services (src/services/)
 
-- **`claude-client.ts`** — `streamClaude(config, context, messages)` async generator, `callClaude(config, context, history)` non-streaming, `trackDailyCost(kv, input, output)`. Parameterized via `ClaudeConfig` (systemPrompt, model, fillerPhrases). Default model: `CLAUDE_MODEL`.
+- **`claude-client.ts`** — `streamClaude(config, context, messages)` async generator, `callClaude(config, context, history)` non-streaming, `trackDailyCost(kv, input, output)`. Parameterized via `ClaudeConfig` (systemPrompt, model, fillerPhrases, toolNames). `toolNames` enables per-app tool filtering — when set, only named tools are sent to Claude; when undefined, all registered tools are sent. Default model: `CLAUDE_MODEL`.
 - **`conversation.ts`** — `ContentBlock`/`Message` types, `compressToolResults()`, `getMessages()`, `saveMessages()`. KV conversation history with 15-min TTL.
-- **`survey-store.ts`** — D1 data access for persistent survey results. `saveSurveyResult(db, result)`, `listSurveyResults(db, opts)`, `getSurveyResult(db, id)`. Used by SurveyApp (write) and admin endpoints (read).
+- **`survey-store.ts`** — D1 data access for survey results only. `saveSurveyResult(db, result)`, `listSurveyResults(db, opts)`, `getSurveyResult(db, id)`. Used by SurveyApp (write) and admin endpoints (read).
+- **`app-store.ts`** — D1 data access for `app_definitions` and `phone_routes` tables. App definitions: `loadAllActiveApps`, `loadAppDefinition`, `saveAppDefinition`, `deleteAppDefinition` (soft-delete), `listAppDefinitions`. Phone routes: `loadPhoneRoutes`, `savePhoneRoute`, `deletePhoneRoute`. Pure data access, no app dependencies.
+- **`cdr-store.ts`** — D1 data access for `call_records` and `call_turns` (CDR). Writes: `createCallRecord`, `endCallRecord`, `updateCallTokens`, `addTurn`, `addTurnsBatch`. Reads: `getCallRecord`, `getCallTurns`, `listCallRecords` (paginated with filters). Seq auto-assigned via `MAX(seq)+1`. All write functions designed for fire-and-forget.
 
 ## Telephony (src/telephony/)
 
@@ -166,10 +255,12 @@ Routes pattern-match on `TurnResult.type` to produce FreeClimb PerCL + TTS. The 
 - **`elevenlabs.ts`** — ElevenLabs TTS client + HMAC signing.
 - **`freeclimb.ts`** — TTSProvider implementations (DirectElevenLabsProvider, FreeClimbDefaultProvider).
 
-Creating a new LLM assistant: extend `ConversationalApp` from `engine/conversational-app`, pass an `AssistantConfig` (~30 lines). Creating a new survey: extend `SurveyApp` from `engine/survey-app`, pass a `SurveyConfig` with questions (~30 lines).
+Creating a new app: `POST /apps/definitions` with type `conversational` or `survey` — no code changes needed. See "Adding a New App" below.
 
 ## Recent changes
 
+- **Call Detail Records (CDR)**: D1-backed call logging with `call_records` and `call_turns` tables. Every call is recorded at start, every event (greeting, caller speech, assistant response, filler, no-input, goodbye) written as a turn with the actual text content. Streaming responses collected via `onStreamComplete` callback in `processRemainingStream` and written as a single joined `assistant_response` turn. All CDR writes are fire-and-forget — never block the call. Admin endpoints: `GET /cdr` (list with pagination/filters) and `GET /cdr/:callId` (full turn-by-turn detail). New `src/services/cdr-store.ts` data access module. `StreamOpts` extended with `onStreamComplete` callback.
+- **D1-driven app definitions + phone routing**: All app configs (conversational and survey) now live in D1 `app_definitions` table with a `type` discriminator and JSON `config` blob. `survey_definitions` table dropped. Worker startup loads active definitions from D1 and registers `ConversationalApp` or `SurveyApp` instances dynamically. New admin endpoints: `GET/POST /apps/definitions`, `GET/DELETE /apps/definitions/:id`, `POST /reload-apps`. Old `/surveys` and `/reload-surveys` endpoints removed. Per-app tool filtering via `ClaudeConfig.toolNames` — tools are code implementations, tool *assignment* is data. Phone number routing via `phone_routes` table: `GET/POST /phone-routes`, `DELETE /phone-routes/:phoneNumber`. Registry tracks `dynamic` flag and `phoneRoutes` map. D1 fallback: code-defined `AvaAssistant`/`RitaAssistant` registered if D1 unavailable. `src/services/app-store.ts` added for D1 data access. `survey-store.ts` slimmed to results-only (definition CRUD removed).
 - **Codebase reorganization**: Replaced monolithic `src/core/` with purpose-aligned directories: `src/engine/` (app framework + turn cycle), `src/services/` (Claude client, conversation, survey store), `src/telephony/` (FreeClimb routes + PerCL), `src/platform/` (auth, rate limiting, env). SurveyApp moved from `apps/survey.ts` to `engine/survey-app.ts`. `sanitizeForTTS` moved from percl to `tts/helpers.ts`. Old `src/core/` and `src/percl/` directories removed.
 - **Phase 4 survey back-end (D1)**: Added `jc-voxnos-surveys` D1 database with `survey_results` table. SurveyApp writes to D1 on completion (KV fallback if D1 unavailable). New data access module `src/services/survey-store.ts`. Admin endpoints: `GET /survey-results` (list with filters) and `GET /survey-results/:id` (detail). `DB?: D1Database` added to Env as optional binding.
 - **Phase 3 conversation engine + app-configurable re-prompts**: Introduced `src/engine/engine.ts` — platform-neutral conversation engine returning `TurnResult` discriminated union. Routes refactored to a FreeClimb adapter that pattern-matches on TurnResult. TTS helpers extracted to `src/tts/helpers.ts` and `src/tts/streaming.ts`. Added `retryPhrases` to `VoxnosApp` interface — each app declares its own no-input retry phrases.
@@ -186,7 +277,12 @@ Creating a new LLM assistant: extend `ConversationalApp` from `engine/conversati
 
 Downstream impact:
 - All `src/core/` imports changed to `src/engine/`, `src/services/`, or `src/platform/`. All `src/percl/` imports changed to `src/telephony/`. `src/routes.ts` moved to `src/telephony/routes.ts`.
-- No change to tool definitions, external contracts, KV patterns, or D1 schema. Keep `COGNOS_PUBLIC_KEY` and `COGNOS` Service Binding present in env.
+- `registry.register()` signature: `(app, opts?: { isDefault?, dynamic? })`. `getForNumber()` checks `phoneRoutes` before `defaultApp`.
+- `src/apps/coco.ts` removed. `src/apps/ava.ts` and `src/apps/rita.ts` kept as D1 fallback only. `survey_definitions` table dropped, replaced by `app_definitions` + `phone_routes`.
+- `ClaudeConfig` extended with `toolNames?: string[]`. `AssistantConfig` extended with `tools?: string[]`. Backward-compatible — undefined means all tools.
+- `/surveys`, `/surveys/:id`, `/reload-surveys` endpoints removed. Replaced by `/apps/definitions`, `/phone-routes`, `/reload-apps`.
+- `survey-store.ts` no longer exports definition CRUD functions. `app-store.ts` handles all definition and route data access.
+- No change to tool implementations, external contracts, or KV patterns. Keep `COGNOS_PUBLIC_KEY` and `COGNOS` Service Binding present in env.
 
 ## Environment
 
@@ -222,13 +318,13 @@ CI/CD: GitHub Actions on push to `master`. Manual: `npx wrangler deploy`. Dev: `
 
 ## Adding a New App
 
-**LLM assistant** (~30 lines): extend `ConversationalApp` from `engine/conversational-app`, pass `AssistantConfig` (id, name, systemPrompt, greetings, fillers, goodbyes, retries). See `src/apps/ava.ts` or `src/apps/rita.ts`.
+**LLM assistant** (no code required): `POST /apps/definitions` with `{ id, name, type: "conversational", config: { systemPrompt, greetings[], fillers[], goodbyes[], retries?[], model?, tools?[] } }`. Tools are optional — when omitted, all registered tools are available. When specified (e.g. `["weather", "cognos"]`), only those tools are sent to Claude. The app is registered in-memory immediately and persists across deploys via D1. To update, `POST` again with the same `id`. To remove, `DELETE /apps/definitions/:id`.
 
-**Survey/scripted flow** (~30 lines): extend `SurveyApp` from `engine/survey-app`, pass `SurveyConfig` (id, name, greeting, closing, questions, retries). See `src/apps/coco.ts`.
+**Survey** (no code required): `POST /apps/definitions` with `{ id, name, type: "survey", config: { greeting, closing, questions[{label,text,type}], retries?[] } }`. Question types: `yes_no`, `scale`, or `open`. Same lifecycle as above.
 
-**Custom**: implement `VoxnosApp` directly from `engine/types` for anything that doesn't fit the above patterns. See `src/apps/echo.ts`.
+**Phone routing**: `POST /phone-routes` with `{ phone_number, app_id, label? }` to assign a dedicated FreeClimb number to any app.
 
-Register in `src/index.ts`: `registry.register(new MyApp())` — pass `true` as second arg for default.
+**Custom**: implement `VoxnosApp` directly from `engine/types` for anything that doesn't fit the above patterns. See `src/apps/echo.ts`. Register in `src/index.ts`: `registry.register(new MyApp())`.
 
 ## Mesh Protocol
 

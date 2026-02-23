@@ -8,6 +8,7 @@ import type { TurnResult } from '../engine/engine.js';
 import { buildPerCL, sanitizeForTTS } from './percl.js';
 import { voiceSlug, greetingCacheKey, callTTS, getTTSProvider } from '../tts/helpers.js';
 import { processRemainingStream } from '../tts/streaming.js';
+import { createCallRecord, addTurn, endCallRecord } from '../services/cdr-store.js';
 
 // Probability of playing an immediate acknowledgment filler before Claude responds.
 // 0.5 = coin flip. Set to 0 to disable, 1 to always play.
@@ -54,6 +55,17 @@ export async function handleIncomingCall(request: Request, env: Env, ctx?: Execu
     };
 
     const response = await app.onStart(context);
+
+    // CDR: record call start + greeting (fire-and-forget)
+    if (env.DB) {
+      const db = env.DB;
+      const greetingText = response.speech?.text ?? '';
+      ctx?.waitUntil(
+        createCallRecord(db, { callId: body.callId, appId: app.id, caller: body.from, callee: body.to })
+          .then(() => addTurn(db, { callId: body.callId, turnType: 'greeting', speaker: 'system', content: greetingText }))
+          .catch(() => {}),
+      );
+    }
 
     // For direct TTS modes (google, 11labs), pre-generate greeting audio and use Play instead of Say.
     // Greetings are one of ~5 fixed strings; we cache them with a stable KV key and long TTL.
@@ -129,6 +141,14 @@ export async function handleConversation(
 
     console.log(JSON.stringify({ event: 'conversation_turn', callId: body.callId, transcript_length: body.transcript?.length ?? 0, transcribeReason: body.transcribeReason, timestamp: new Date().toISOString() }));
 
+    const db = env.DB;
+
+    // CDR: detect caller hangup (FreeClimb sends transcribeReason=hangup on disconnect)
+    if (body.transcribeReason === 'hangup' && !body.transcript) {
+      if (db) ctx?.waitUntil(endCallRecord(db, body.callId, 'completed').catch(() => {}));
+      // Still process normally — app.onEnd will fire via the engine
+    }
+
     // Route to app
     const app = registry.getForNumber(body.to);
 
@@ -162,19 +182,39 @@ export async function handleConversation(
 
     if (result.type === 'no-input') {
       console.log(JSON.stringify({ event: 'no_input', callId: body.callId, transcribeReason: body.transcribeReason, timestamp: new Date().toISOString() }));
+      // CDR: record no-input turn
+      if (db) ctx?.waitUntil(addTurn(db, { callId: body.callId, turnType: 'no_input', speaker: 'system', content: result.retryPhrase, meta: { transcribeReason: body.transcribeReason } }).catch(() => {}));
       return handleNoInputResponse(result.retryPhrase, origin, env);
     }
 
     if (result.type === 'stream') {
+      // CDR: record caller speech
+      if (db && body.transcript) {
+        ctx!.waitUntil(addTurn(db, { callId: body.callId, turnType: 'caller_speech', speaker: 'caller', content: body.transcript }).catch(() => {}));
+      }
+
       // Per-turn UUID prevents stale KV reads
       const turnId = crypto.randomUUID();
       const callKey = `stream:${context.callId}:${turnId}`;
 
+      // CDR callback: fired when streaming completes with all sentence texts
+      const onStreamComplete = db
+        ? async (sentences: string[], hangup: boolean) => {
+            const fullText = sentences.join(' ');
+            if (fullText) {
+              await addTurn(db, { callId: body.callId, turnType: hangup ? 'goodbye' : 'assistant_response', speaker: 'system', content: fullText }).catch(() => {});
+            }
+            if (hangup) await endCallRecord(db, body.callId, 'completed').catch(() => {});
+          }
+        : undefined;
+
       try {
         if (result.preFiller) {
-          return await handlePreFillerStream(result, context, turnId, callKey, origin, env, ctx!);
+          // CDR: record filler turn
+          if (db) ctx!.waitUntil(addTurn(db, { callId: body.callId, turnType: 'filler', speaker: 'system', content: result.preFiller.phrase }).catch(() => {}));
+          return await handlePreFillerStream(result, context, turnId, callKey, origin, env, ctx!, onStreamComplete);
         }
-        return await handleStandardStream(result, context, turnId, callKey, origin, env, ctx!);
+        return await handleStandardStream(result, context, turnId, callKey, origin, env, ctx!, onStreamComplete);
       } catch (streamErr) {
         console.error('Streaming path error, falling back to non-streaming:', streamErr);
         // Fall through to non-streaming below
@@ -184,10 +224,28 @@ export async function handleConversation(
       const fallback = await app.onSpeech(context, input);
       const percl = await buildPerCL(fallback, request.url, getTTSProvider(env));
       if (fallback.hangup && result.cleanup && ctx) ctx.waitUntil(result.cleanup());
+      // CDR: record fallback response
+      if (db && fallback.speech?.text) {
+        ctx?.waitUntil(
+          addTurn(db, { callId: body.callId, turnType: fallback.hangup ? 'goodbye' : 'assistant_response', speaker: 'system', content: fallback.speech.text })
+            .then(() => fallback.hangup ? endCallRecord(db, body.callId, 'completed') : undefined)
+            .catch(() => {}),
+        );
+      }
       return Response.json(percl, { headers: { 'Content-Type': 'application/json' } });
     }
 
     // type === 'response' — non-streaming path
+    // CDR: record caller speech + response
+    if (db) {
+      const cdrWrites = async () => {
+        if (body.transcript) await addTurn(db, { callId: body.callId, turnType: 'caller_speech', speaker: 'caller', content: body.transcript! }).catch(() => {});
+        if (result.speech.speech?.text) await addTurn(db, { callId: body.callId, turnType: result.speech.hangup ? 'goodbye' : 'assistant_response', speaker: 'system', content: result.speech.speech.text }).catch(() => {});
+        if (result.speech.hangup) await endCallRecord(db, body.callId, 'completed').catch(() => {});
+      };
+      ctx?.waitUntil(cdrWrites());
+    }
+
     const percl = await buildPerCL(result.speech, request.url, getTTSProvider(env));
 
     if (result.cleanup && ctx) {
@@ -243,6 +301,7 @@ async function handlePreFillerStream(
   origin: string,
   env: Env,
   ctx: ExecutionContext,
+  onStreamComplete?: (sentences: string[], hangup: boolean) => Promise<void>,
 ): Promise<Response> {
   const { preFiller, stream, skipFillers, cleanup } = result;
   console.log(JSON.stringify({ event: 'pre_filler', callId: context.callId, turnId, timestamp: new Date().toISOString() }));
@@ -256,7 +315,7 @@ async function handlePreFillerStream(
   }
 
   // Start the full stream in background — skipFillers prevents double-filler
-  ctx.waitUntil(processRemainingStream(stream, callKey, env, 0, { skipFillers, onHangup: cleanup }));
+  ctx.waitUntil(processRemainingStream(stream, callKey, env, 0, { skipFillers, onHangup: cleanup, onStreamComplete }));
 
   return Response.json(
     [
@@ -276,6 +335,7 @@ async function handleStandardStream(
   origin: string,
   env: Env,
   ctx: ExecutionContext,
+  onStreamComplete?: (sentences: string[], hangup: boolean) => Promise<void>,
 ): Promise<Response> {
   const { stream, cleanup } = result;
   const firstResult = await stream.next();
@@ -307,6 +367,8 @@ async function handleStandardStream(
       if (chunk1.hangup) {
         // Generator signaled hangup — brief pause so goodbye doesn't cut off abruptly
         if (cleanup) ctx.waitUntil(cleanup());
+        // CDR: record goodbye (single sentence, stream complete)
+        if (onStreamComplete) ctx.waitUntil(onStreamComplete([safeSentence1], true).catch(() => {}));
         return Response.json(
           [{ Play: { file: `${origin}/tts-cache?id=${s1Id}` } }, { Pause: { length: 300 } }, { Hangup: {} }],
           { headers: { 'Content-Type': 'application/json' } },
@@ -314,8 +376,12 @@ async function handleStandardStream(
       }
 
       // Queue remaining sentences in background and start redirect chain
+      // The onStreamComplete callback receives remaining sentences; prepend the first sentence
+      const wrappedOnComplete = onStreamComplete
+        ? async (sentences: string[], hangup: boolean) => onStreamComplete([safeSentence1, ...sentences], hangup)
+        : undefined;
       await env.RATE_LIMIT_KV.put(`${callKey}:1`, s1Id, { expirationTtl: 120 });
-      ctx.waitUntil(processRemainingStream(stream, callKey, env, 1, { onHangup: cleanup }));
+      ctx.waitUntil(processRemainingStream(stream, callKey, env, 1, { onHangup: cleanup, onStreamComplete: wrappedOnComplete }));
 
       return Response.json(
         [

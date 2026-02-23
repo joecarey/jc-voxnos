@@ -1,5 +1,5 @@
-// Survey result storage — D1 data access for persistent survey results.
-// Follows the same pattern as conversation.ts (pure data access, no app dependencies).
+// Survey result storage — D1 data access for completed survey responses.
+// App definitions have moved to app-store.ts.
 
 import type { SurveyAnswer } from '../engine/survey-app.js';
 

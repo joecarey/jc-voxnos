@@ -18,6 +18,8 @@ export interface AssistantConfig {
   goodbyes: string[];
   retries?: string[];
   model?: string;
+  /** Tool names this app can use (resolved against ToolRegistry). When undefined, all tools are available. */
+  tools?: string[];
 }
 
 export class ConversationalApp extends BaseApp {
@@ -36,6 +38,7 @@ export class ConversationalApp extends BaseApp {
       systemPrompt: config.systemPrompt,
       model: config.model ?? CLAUDE_MODEL,
       fillerPhrases: config.fillers,
+      toolNames: config.tools,
     };
   }
 

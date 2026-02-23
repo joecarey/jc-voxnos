@@ -10,10 +10,19 @@ export interface ClaudeConfig {
   systemPrompt: string;
   model: string;
   fillerPhrases: string[];
+  /** When set, only these tools are sent to Claude. When undefined, all registered tools are sent. */
+  toolNames?: string[];
 }
 
 /** Default Claude model for voice apps. */
 export const CLAUDE_MODEL = 'claude-sonnet-4-6';
+
+/** Resolve tool definitions based on config. When toolNames is set, filter; otherwise return all. */
+function resolveTools(config: ClaudeConfig) {
+  return config.toolNames
+    ? toolRegistry.getDefinitionsFor(config.toolNames)
+    : toolRegistry.getDefinitions();
+}
 
 /**
  * Core streaming Claude call with tool-use support.
@@ -43,7 +52,7 @@ export async function* streamClaude(
         max_tokens: 300,
         system: config.systemPrompt,
         messages,
-        tools: toolRegistry.getDefinitions(),
+        tools: resolveTools(config),
         stream: true,
       }),
     });
@@ -236,7 +245,7 @@ export async function callClaude(
           max_tokens: 300,
           system: config.systemPrompt,
           messages: history,
-          tools: toolRegistry.getDefinitions(),
+          tools: resolveTools(config),
         }),
       });
 

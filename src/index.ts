@@ -5,7 +5,10 @@ import { EchoApp } from './apps/echo.js';
 import { AvaAssistant } from './apps/ava.js';
 import { RitaAssistant } from './apps/rita.js';
 import { OttoAssistant } from './apps/otto.js';
-import { CocoSurvey } from './apps/coco.js';
+import { ConversationalApp } from './engine/conversational-app.js';
+import type { AssistantConfig } from './engine/conversational-app.js';
+import { SurveyApp } from './engine/survey-app.js';
+import type { SurveyConfig } from './engine/survey-app.js';
 import type { Env } from './engine/types.js';
 import { validateEnv, getEnvSetupInstructions } from './platform/env.js';
 import { requireAdminAuth, createUnauthorizedResponse } from './platform/auth.js';
@@ -27,20 +30,89 @@ import {
   handleUpdateApplication,
 } from './telephony/routes.js';
 import { listSurveyResults, getSurveyResult } from './services/survey-store.js';
+import { listCallRecords, getCallRecord, getCallTurns } from './services/cdr-store.js';
+import {
+  loadAllActiveApps, loadAppDefinition, saveAppDefinition,
+  deleteAppDefinition, listAppDefinitions,
+  loadPhoneRoutes, savePhoneRoute, deletePhoneRoute,
+} from './services/app-store.js';
+import type { AppDefinitionRow } from './services/app-store.js';
 import { callElevenLabs, callGoogleTTS, computeTtsSignature } from './tts/index.js';
 
 // Deferred setup — runs once per isolate on first request so env is available.
 let setupDone = false;
-function setup(env: Env): void {
+async function setup(env: Env): Promise<void> {
   if (setupDone) return;
+
+  // Register tools
   toolRegistry.register(new WeatherTool());
   toolRegistry.register(new CognosTool(env.COGNOS_PUBLIC_KEY, env.COGNOS));
+
+  // Register code-defined apps (not config-driven)
   registry.register(new EchoApp());
   registry.register(new OttoAssistant());
-  registry.register(new RitaAssistant());
-  registry.register(new CocoSurvey());
-  registry.register(new AvaAssistant(), true);
+
+  // Load all app definitions from D1 (conversational + survey)
+  if (env.DB) {
+    try {
+      const defs = await loadAllActiveApps(env.DB);
+      for (const def of defs) {
+        registerAppFromDefinition(def);
+      }
+      // Load phone routes
+      const routes = await loadPhoneRoutes(env.DB);
+      for (const route of routes) {
+        registry.setPhoneRoute(route.phone_number, route.app_id);
+      }
+      if (defs.length) {
+        console.log(JSON.stringify({ event: 'apps_loaded', count: defs.length, ids: defs.map(d => d.id) }));
+      }
+    } catch (err) {
+      console.error('Failed to load app definitions from D1, falling back to static:', err);
+      // Fallback: register code-defined Ava and Rita
+      registry.register(new AvaAssistant(), { isDefault: true });
+      registry.register(new RitaAssistant());
+    }
+  } else {
+    // No D1 — use code-defined apps
+    registry.register(new AvaAssistant(), { isDefault: true });
+    registry.register(new RitaAssistant());
+  }
+
   setupDone = true;
+}
+
+/** Instantiate and register an app from a D1 definition row. */
+function registerAppFromDefinition(def: AppDefinitionRow): void {
+  const opts = { dynamic: true, isDefault: def.is_default };
+  if (def.type === 'conversational') {
+    const c = def.config as Record<string, unknown>;
+    const config: AssistantConfig = {
+      id: def.id,
+      name: def.name,
+      systemPrompt: c.systemPrompt as string,
+      greetings: c.greetings as string[],
+      fillers: c.fillers as string[],
+      goodbyes: c.goodbyes as string[],
+      retries: c.retries as string[] | undefined,
+      model: c.model as string | undefined,
+      tools: c.tools as string[] | undefined,
+    };
+    registry.register(new ConversationalApp(config), opts);
+  } else if (def.type === 'survey') {
+    const c = def.config as Record<string, unknown>;
+    const config: SurveyConfig = {
+      id: def.id,
+      name: def.name,
+      greeting: c.greeting as string,
+      closing: c.closing as string,
+      questions: c.questions as SurveyConfig['questions'],
+      retries: c.retries as string[] | undefined,
+    };
+    registry.register(new SurveyApp(config), opts);
+  } else {
+    console.warn(`Unknown app type "${def.type}" for app "${def.id}", skipping`);
+  }
 }
 
 async function requireAdmin(request: Request, env: Env): Promise<Response | null> {
@@ -52,6 +124,76 @@ async function requireAdmin(request: Request, env: Env): Promise<Response | null
   const rateLimit = await checkRateLimit(env.RATE_LIMIT_KV, `admin:${apiKey.substring(0, 16)}`, RATE_LIMITS.ADMIN);
   if (!rateLimit.allowed) return new Response('Admin rate limit exceeded', { status: 429, headers: { 'Retry-After': '60' } });
 
+  return null;
+}
+
+const VALID_QUESTION_TYPES = new Set(['yes_no', 'scale', 'open']);
+const VALID_APP_TYPES = new Set(['conversational', 'survey']);
+
+function validateAppInput(body: Record<string, unknown>): string | null {
+  if (typeof body.id !== 'string' || !/^[a-z0-9-]{1,32}$/.test(body.id)) {
+    return 'id must be 1-32 lowercase alphanumeric/hyphen characters';
+  }
+  if (typeof body.name !== 'string' || !body.name.trim()) return 'name is required';
+  if (!VALID_APP_TYPES.has(body.type as string)) return 'type must be conversational or survey';
+  if (!body.config || typeof body.config !== 'object') return 'config is required';
+
+  const config = body.config as Record<string, unknown>;
+
+  if (body.type === 'conversational') {
+    return validateConversationalConfig(config);
+  }
+  return validateSurveyConfig(config);
+}
+
+function validateConversationalConfig(c: Record<string, unknown>): string | null {
+  if (typeof c.systemPrompt !== 'string' || !c.systemPrompt.trim()) return 'config.systemPrompt is required';
+  if (!Array.isArray(c.greetings) || c.greetings.length === 0) return 'config.greetings must be a non-empty string array';
+  if (!c.greetings.every((g: unknown) => typeof g === 'string')) return 'config.greetings must contain only strings';
+  if (!Array.isArray(c.fillers) || c.fillers.length === 0) return 'config.fillers must be a non-empty string array';
+  if (!c.fillers.every((f: unknown) => typeof f === 'string')) return 'config.fillers must contain only strings';
+  if (!Array.isArray(c.goodbyes) || c.goodbyes.length === 0) return 'config.goodbyes must be a non-empty string array';
+  if (!c.goodbyes.every((g: unknown) => typeof g === 'string')) return 'config.goodbyes must contain only strings';
+  if (c.retries !== undefined && c.retries !== null) {
+    if (!Array.isArray(c.retries) || !c.retries.every((r: unknown) => typeof r === 'string')) {
+      return 'config.retries must be an array of strings';
+    }
+  }
+  if (c.model !== undefined && typeof c.model !== 'string') return 'config.model must be a string';
+  if (c.tools !== undefined && c.tools !== null) {
+    if (!Array.isArray(c.tools) || !c.tools.every((t: unknown) => typeof t === 'string')) {
+      return 'config.tools must be an array of strings';
+    }
+    for (const name of c.tools as string[]) {
+      if (!toolRegistry.get(name)) return `config.tools: unknown tool "${name}"`;
+    }
+  }
+  return null;
+}
+
+function validateSurveyConfig(c: Record<string, unknown>): string | null {
+  if (typeof c.greeting !== 'string' || !c.greeting.trim()) return 'config.greeting is required';
+  if (typeof c.closing !== 'string' || !c.closing.trim()) return 'config.closing is required';
+  if (!Array.isArray(c.questions) || c.questions.length === 0) return 'config.questions must be a non-empty array';
+  for (let i = 0; i < c.questions.length; i++) {
+    const q = c.questions[i] as Record<string, unknown>;
+    if (typeof q.label !== 'string' || !q.label.trim()) return `config.questions[${i}].label is required`;
+    if (typeof q.text !== 'string' || !q.text.trim()) return `config.questions[${i}].text is required`;
+    if (!VALID_QUESTION_TYPES.has(q.type as string)) return `config.questions[${i}].type must be yes_no, scale, or open`;
+  }
+  if (c.retries !== undefined && c.retries !== null) {
+    if (!Array.isArray(c.retries) || !c.retries.every((r: unknown) => typeof r === 'string')) {
+      return 'config.retries must be an array of strings';
+    }
+  }
+  return null;
+}
+
+function validatePhoneRouteInput(body: Record<string, unknown>): string | null {
+  if (typeof body.phone_number !== 'string' || !body.phone_number.trim()) return 'phone_number is required';
+  if (typeof body.app_id !== 'string' || !body.app_id.trim()) return 'app_id is required';
+  if (!registry.get(body.app_id)) return `app_id "${body.app_id}" not found in registry`;
+  if (body.label !== undefined && body.label !== null && typeof body.label !== 'string') return 'label must be a string';
   return null;
 }
 
@@ -67,7 +209,7 @@ export default {
       });
     }
 
-    setup(env);
+    await setup(env);
 
     const url = new URL(request.url);
 
@@ -208,6 +350,170 @@ export default {
 
       const results = await listSurveyResults(env.DB, { surveyId, from, to, limit, offset });
       return Response.json({ results, count: results.length });
+    }
+
+    // CDR — single call detail with turns
+    if (url.pathname.startsWith('/cdr/') && request.method === 'GET') {
+      const denied = await requireAdmin(request, env);
+      if (denied) return denied;
+      if (!env.DB) return Response.json({ error: 'D1 not configured' }, { status: 501 });
+
+      const callId = url.pathname.slice('/cdr/'.length);
+      if (!callId) return Response.json({ error: 'Missing callId' }, { status: 400 });
+
+      const record = await getCallRecord(env.DB, callId);
+      if (!record) return Response.json({ error: 'Not found' }, { status: 404 });
+      const turns = await getCallTurns(env.DB, callId);
+      return Response.json({ record, turns });
+    }
+
+    // CDR — list call records with optional filters
+    if (url.pathname === '/cdr' && request.method === 'GET') {
+      const denied = await requireAdmin(request, env);
+      if (denied) return denied;
+      if (!env.DB) return Response.json({ error: 'D1 not configured' }, { status: 501 });
+
+      const appId = url.searchParams.get('app_id') ?? undefined;
+      const from = url.searchParams.get('from') ?? undefined;
+      const to = url.searchParams.get('to') ?? undefined;
+      const caller = url.searchParams.get('caller') ?? undefined;
+      const limit = url.searchParams.has('limit') ? parseInt(url.searchParams.get('limit')!, 10) : undefined;
+      const offset = url.searchParams.has('offset') ? parseInt(url.searchParams.get('offset')!, 10) : undefined;
+
+      const records = await listCallRecords(env.DB, { appId, from, to, caller, limit, offset });
+      return Response.json({ records, count: records.length });
+    }
+
+    // App definitions — single definition by ID
+    if (url.pathname.startsWith('/apps/definitions/') && request.method === 'GET') {
+      const denied = await requireAdmin(request, env);
+      if (denied) return denied;
+      if (!env.DB) return Response.json({ error: 'D1 not configured' }, { status: 501 });
+
+      const appId = url.pathname.split('/')[3];
+      if (!appId) return Response.json({ error: 'Missing app ID' }, { status: 400 });
+
+      const def = await loadAppDefinition(env.DB, appId);
+      if (!def) return Response.json({ error: 'Not found' }, { status: 404 });
+      return Response.json(def);
+    }
+
+    // App definitions — delete (soft-delete)
+    if (url.pathname.startsWith('/apps/definitions/') && request.method === 'DELETE') {
+      const denied = await requireAdmin(request, env);
+      if (denied) return denied;
+      if (!env.DB) return Response.json({ error: 'D1 not configured' }, { status: 501 });
+
+      const appId = url.pathname.split('/')[3];
+      if (!appId) return Response.json({ error: 'Missing app ID' }, { status: 400 });
+
+      const deleted = await deleteAppDefinition(env.DB, appId);
+      if (!deleted) return Response.json({ error: 'Not found or already inactive' }, { status: 404 });
+
+      registry.remove(appId);
+      return Response.json({ success: true, id: appId });
+    }
+
+    // App definitions — list all (active + inactive)
+    if (url.pathname === '/apps/definitions' && request.method === 'GET') {
+      const denied = await requireAdmin(request, env);
+      if (denied) return denied;
+      if (!env.DB) return Response.json({ error: 'D1 not configured' }, { status: 501 });
+
+      const definitions = await listAppDefinitions(env.DB);
+      return Response.json({ definitions, count: definitions.length });
+    }
+
+    // App definitions — create or update
+    if (url.pathname === '/apps/definitions' && request.method === 'POST') {
+      const denied = await requireAdmin(request, env);
+      if (denied) return denied;
+      if (!env.DB) return Response.json({ error: 'D1 not configured' }, { status: 501 });
+
+      const body = await request.json() as Record<string, unknown>;
+      const validationError = validateAppInput(body);
+      if (validationError) return Response.json({ error: validationError }, { status: 400 });
+
+      const saved = await saveAppDefinition(env.DB, {
+        id: body.id as string,
+        name: body.name as string,
+        type: body.type as 'conversational' | 'survey',
+        config: body.config as Record<string, unknown>,
+        is_default: body.is_default as boolean | undefined,
+      });
+      if (!saved) return Response.json({ error: 'Failed to save app definition' }, { status: 500 });
+
+      // Reload this app in-memory so it takes effect immediately
+      registry.remove(body.id as string);
+      const def = await loadAppDefinition(env.DB, body.id as string);
+      if (def) registerAppFromDefinition(def);
+
+      return Response.json({ success: true, id: body.id });
+    }
+
+    // Phone routes — list all
+    if (url.pathname === '/phone-routes' && request.method === 'GET') {
+      const denied = await requireAdmin(request, env);
+      if (denied) return denied;
+      if (!env.DB) return Response.json({ error: 'D1 not configured' }, { status: 501 });
+
+      const routes = await loadPhoneRoutes(env.DB);
+      return Response.json({ routes, count: routes.length });
+    }
+
+    // Phone routes — create or update
+    if (url.pathname === '/phone-routes' && request.method === 'POST') {
+      const denied = await requireAdmin(request, env);
+      if (denied) return denied;
+      if (!env.DB) return Response.json({ error: 'D1 not configured' }, { status: 501 });
+
+      const body = await request.json() as Record<string, unknown>;
+      const routeError = validatePhoneRouteInput(body);
+      if (routeError) return Response.json({ error: routeError }, { status: 400 });
+
+      const saved = await savePhoneRoute(env.DB, {
+        phoneNumber: body.phone_number as string,
+        appId: body.app_id as string,
+        label: body.label as string | undefined,
+      });
+      if (!saved) return Response.json({ error: 'Failed to save phone route' }, { status: 500 });
+
+      registry.setPhoneRoute(body.phone_number as string, body.app_id as string);
+      return Response.json({ success: true, phone_number: body.phone_number, app_id: body.app_id });
+    }
+
+    // Phone routes — delete
+    if (url.pathname.startsWith('/phone-routes/') && request.method === 'DELETE') {
+      const denied = await requireAdmin(request, env);
+      if (denied) return denied;
+      if (!env.DB) return Response.json({ error: 'D1 not configured' }, { status: 501 });
+
+      const phoneNumber = decodeURIComponent(url.pathname.split('/')[2]);
+      if (!phoneNumber) return Response.json({ error: 'Missing phone number' }, { status: 400 });
+
+      const deleted = await deletePhoneRoute(env.DB, phoneNumber);
+      if (!deleted) return Response.json({ error: 'Not found' }, { status: 404 });
+
+      registry.removePhoneRoute(phoneNumber);
+      return Response.json({ success: true, phone_number: phoneNumber });
+    }
+
+    // Reload all app definitions and phone routes from D1
+    if (url.pathname === '/reload-apps' && request.method === 'POST') {
+      const denied = await requireAdmin(request, env);
+      if (denied) return denied;
+      if (!env.DB) return Response.json({ error: 'D1 not configured' }, { status: 501 });
+
+      registry.removeDynamic();
+      const defs = await loadAllActiveApps(env.DB);
+      for (const def of defs) {
+        registerAppFromDefinition(def);
+      }
+      const routes = await loadPhoneRoutes(env.DB);
+      for (const route of routes) {
+        registry.setPhoneRoute(route.phone_number, route.app_id);
+      }
+      return Response.json({ success: true, apps: defs.length, routes: routes.length, ids: defs.map(d => d.id) });
     }
 
     // On-demand TTS endpoint — called by FreeClimb Play command (TTS_MODE=google|11labs)
