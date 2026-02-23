@@ -36,7 +36,7 @@ Multi-app voice platform: FreeClimb telephony + Claude Sonnet 4.6 + Google Chirp
 **Active**: `TTS_MODE=google` → `en-US-Chirp3-HD-Despina` (Chirp 3 HD), LINEAR16 WAV 8kHz
 **Modes**: `google` (active) | `11labs` (direct ElevenLabs) | `freeclimb` (built-in, always fallback)
 **Fallback**: google/11labs failure → FreeClimb built-in Say automatically
-**Cache key rule**: stable keys append `VOICE_SLUG`; `/tts-cache` always `Cache-Control: no-store`
+**Cache key rule**: stable keys append `voiceSlug(env)` (mode-aware: "despina" for google, "sarah" for 11labs); `/tts-cache` always `Cache-Control: no-store`
 
 ## Streaming Flow (TTS_MODE=google|11labs)
 
@@ -62,7 +62,7 @@ Multi-app voice platform: FreeClimb telephony + Claude Sonnet 4.6 + Google Chirp
 - Keep FreeClimb webhook signature validation
 - Keep per-turn UUID in KV keys — prevents stale cross-turn reads
 - Do not weaken rate limiting
-- Keep `VOICE_SLUG` appended to all stable TTS cache keys
+- Keep `voiceSlug(env)` appended to all stable TTS cache keys
 - Keep `Cache-Control: no-store` on all `/tts-cache` responses
 
 ## Cognos Dependency
@@ -73,6 +73,18 @@ Calls `POST https://jc-cognos.cloudflare-5cf.workers.dev/brief` via the `cognos`
 - Request: `{q, voice_mode: true, voice_detail: 1–5}`
 - Response: `answer` field (speakable text, no URLs/citations)
 - **Stability rule**: if cognos changes this contract, update this section.
+
+## Recent changes
+
+- Cognos tool (`src/tools/cognos.ts`) now includes retry/backoff for transient HTTP errors (429/5xx).
+- System prompt updated: Claude now has explicit guidance on when to use `get_industry_brief` vs `get_weather` vs answering general questions from its own knowledge.
+- Removed hardcoded brief-detection quick-path — Claude's tool-use loop handles all tool routing.
+- `onEnd()` now wired up: fires via `ctx.waitUntil()` on hangup in both streaming and non-streaming paths.
+- `VOICE_SLUG` replaced with `voiceSlug(env)` function — derives slug from active TTS mode so cache keys are correct when switching providers.
+- Removed dead code: `/transfer` endpoint reference (no handler existed), `OutDial` PerCL type, `transfer` field from `AppResponse`, unused `DEFAULT_TTS_PROVIDER`, unused `TOOL_COGNOS`/`TOOL_WEATHER` rate limit configs, `@supabase/supabase-js` dependency.
+
+Downstream impact:
+- No change to tool definitions or KV schemas; keep `COGNOS_PUBLIC_KEY` present in env.
 
 ## Environment
 

@@ -26,8 +26,6 @@ export const RATE_LIMITS = {
   CONVERSATION: { maxRequests: 60, windowSeconds: 60, keyPrefix: 'rl:conv' },  // 60/min per call
   CALL_START: { maxRequests: 20, windowSeconds: 60, keyPrefix: 'rl:call' },   // 20/min per IP
   ADMIN: { maxRequests: 20, windowSeconds: 60, keyPrefix: 'rl:admin' },       // 20/min per key
-  TOOL_WEATHER: { maxRequests: 30, windowSeconds: 60, keyPrefix: 'rl:weather' }, // 30/min global
-  TOOL_COGNOS: { maxRequests: 20, windowSeconds: 60, keyPrefix: 'rl:cognos' },   // 20/min global
 };
 
 /**

@@ -7,7 +7,11 @@ import { DirectElevenLabsProvider, FreeClimbDefaultProvider, ELEVENLABS_VOICE_ID
 
 // Short voice identifier appended to all stable TTS cache keys.
 // When the voice changes, URLs change and FreeClimb's HTTP cache is automatically busted.
-const VOICE_SLUG = GOOGLE_TTS_VOICE.split('-').pop()!.toLowerCase();
+// Derived per-mode so switching TTS_MODE invalidates the cache correctly.
+function voiceSlug(env: Env): string {
+  if (env.TTS_MODE === '11labs') return 'sarah';
+  return GOOGLE_TTS_VOICE.split('-').pop()!.toLowerCase(); // "despina"
+}
 
 // Phrases for when the caller's speech wasn't captured — randomized to avoid repetition
 const RETRY_PHRASES = [
@@ -23,13 +27,13 @@ const RETRY_PHRASES = [
  * short and human-readable. Falls back to a sanitized prefix for any
  * other greeting text that gets added in the future.
  */
-function greetingCacheKey(text: string): string {
+function greetingCacheKey(text: string, slug: string): string {
   const lower = text.toLowerCase();
-  if (lower.includes('morning'))   return `greeting-morning-${VOICE_SLUG}`;
-  if (lower.includes('afternoon')) return `greeting-afternoon-${VOICE_SLUG}`;
-  if (lower.includes('evening'))   return `greeting-evening-${VOICE_SLUG}`;
+  if (lower.includes('morning'))   return `greeting-morning-${slug}`;
+  if (lower.includes('afternoon')) return `greeting-afternoon-${slug}`;
+  if (lower.includes('evening'))   return `greeting-evening-${slug}`;
   // Generic fallback: alphanumeric slug, max 40 chars
-  return 'greeting-' + lower.replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40) + `-${VOICE_SLUG}`;
+  return 'greeting-' + lower.replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40) + `-${slug}`;
 }
 
 function freeclimbAuth(env: Env): { auth: string; apiBase: string } {
@@ -61,7 +65,7 @@ function callTTS(text: string, env: Env): Promise<ArrayBuffer> {
 /**
  * FreeClimb call webhook - handles incoming calls
  */
-export async function handleIncomingCall(request: Request, env: Env): Promise<Response> {
+export async function handleIncomingCall(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
   try {
     const body = await request.json() as {
       callId: string;
@@ -101,7 +105,7 @@ export async function handleIncomingCall(request: Request, env: Env): Promise<Re
       const safeText = sanitizeForTTS(response.speech.text);
       if (safeText) {
         const origin = new URL(request.url).origin;
-        const greetingId = greetingCacheKey(safeText);
+        const greetingId = greetingCacheKey(safeText, voiceSlug(env));
 
         try {
           let audio = await env.RATE_LIMIT_KV.get(`tts:${greetingId}`, 'arrayBuffer');
@@ -123,6 +127,11 @@ export async function handleIncomingCall(request: Request, env: Env): Promise<Re
 
     // Convert app response to FreeClimb PerCL
     const percl = await buildPerCL(response, request.url, getTTSProvider(env));
+
+    // Fire onEnd cleanup if the greeting itself signals hangup (unlikely but correct)
+    if (response.hangup && app.onEnd) {
+      ctx?.waitUntil(app.onEnd(context));
+    }
 
     return Response.json(percl, {
       headers: { 'Content-Type': 'application/json' },
@@ -216,7 +225,7 @@ export async function handleConversation(
       const origin = new URL(request.url).origin;
       const retryIdx = Math.floor(Math.random() * RETRY_PHRASES.length);
       const retryText = RETRY_PHRASES[retryIdx];
-      const retryCacheKey = `retry-${retryIdx}-${VOICE_SLUG}`;
+      const retryCacheKey = `retry-${retryIdx}-${voiceSlug(env)}`;
       let retryAudio = await env.RATE_LIMIT_KV.get(`tts:${retryCacheKey}`, 'arrayBuffer');
       if (!retryAudio) {
         retryAudio = await callTTS(retryText, env);
@@ -235,7 +244,7 @@ export async function handleConversation(
     }
 
     // V2: streaming path — first sentence TTS'd immediately, rest processed in background
-    if ((env.TTS_MODE === '11labs' || env.TTS_MODE === 'google') && ctx && app.streamSpeech) {
+    if ((env.TTS_MODE === 'google' || env.TTS_MODE === '11labs') && ctx && app.streamSpeech) {
       const origin = new URL(request.url).origin;
       // Per-turn UUID prevents stale KV reads: each conversation turn gets its own
       // namespace so /continue never picks up sentence-2+ entries from a prior turn.
@@ -256,7 +265,7 @@ export async function handleConversation(
             let s1Audio: ArrayBuffer;
             let s1Id: string;
             if (chunk1.cacheKey) {
-              s1Id = `${chunk1.cacheKey}-${VOICE_SLUG}`;
+              s1Id = `${chunk1.cacheKey}-${voiceSlug(env)}`;
               const cached = await env.RATE_LIMIT_KV.get(`tts:${s1Id}`, 'arrayBuffer');
               if (cached) {
                 s1Audio = cached;
@@ -272,6 +281,7 @@ export async function handleConversation(
 
             if (chunk1.hangup) {
               // Generator signaled hangup — brief pause so goodbye doesn't cut off abruptly
+              if (app.onEnd) ctx.waitUntil(app.onEnd(context));
               return Response.json(
                 [{ Play: { file: `${origin}/tts-cache?id=${s1Id}` } }, { Pause: { length: 300 } }, { Hangup: {} }],
                 { headers: { 'Content-Type': 'application/json' } },
@@ -302,6 +312,10 @@ export async function handleConversation(
 
     // Convert to PerCL
     const percl = await buildPerCL(response, request.url, getTTSProvider(env));
+
+    if (response.hangup && app.onEnd && ctx) {
+      ctx.waitUntil(app.onEnd(context));
+    }
 
     return Response.json(percl, {
       headers: { 'Content-Type': 'application/json' },

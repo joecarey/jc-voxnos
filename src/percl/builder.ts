@@ -3,7 +3,6 @@
 
 import type { AppResponse } from '../core/types.js';
 import type { TTSProvider, TTSEngineConfig } from '../tts/index.js';
-import { ElevenLabsProvider } from '../tts/index.js';
 
 /**
  * FreeClimb PerCL command types
@@ -26,10 +25,6 @@ export interface PerCLCommand {
   };
   Pause?: { length: number };
   Hangup?: Record<string, never>;
-  OutDial?: {
-    destination: string;
-    callConnectUrl: string;
-  };
   Redirect?: {
     actionUrl: string;
   };
@@ -49,14 +44,6 @@ export function sanitizeForTTS(text: string): string {
 }
 
 /**
- * Default TTS provider (FreeClimb-mediated ElevenLabs, used when TTS_MODE=freeclimb)
- */
-const DEFAULT_TTS_PROVIDER = new ElevenLabsProvider({
-  voiceId: 'EXAVITQu4vr4xnSDxMaL',  // Sarah voice
-  languageCode: 'en',
-});
-
-/**
  * Convert app response to FreeClimb PerCL commands.
  *
  * TTS mode selection:
@@ -64,16 +51,11 @@ const DEFAULT_TTS_PROVIDER = new ElevenLabsProvider({
  * - If ttsProvider.getPlayUrl exists (DirectElevenLabsProvider, TTS_MODE=11labs): emits Play
  *   command pointing to /tts endpoint — HMAC-signed URL.
  * - Otherwise: emits Say command with optional engine config — FreeClimb-mediated TTS (fallback).
- *
- * @param response - App response from onStart or onSpeech handler
- * @param baseUrl - Base URL for webhook callbacks
- * @param ttsProvider - TTS provider (defaults to FreeClimb-mediated ElevenLabs)
- * @returns Array of FreeClimb PerCL commands
  */
 export async function buildPerCL(
   response: AppResponse,
   baseUrl: string,
-  ttsProvider: TTSProvider = DEFAULT_TTS_PROVIDER,
+  ttsProvider: TTSProvider,
 ): Promise<PerCLCommand[]> {
   const percl: PerCLCommand[] = [];
   const origin = new URL(baseUrl).origin;
@@ -123,16 +105,6 @@ export async function buildPerCL(
   if (response.hangup) {
     percl.push({ Pause: { length: 300 } });
     percl.push({ Hangup: {} });
-  }
-
-  // Transfer if requested
-  if (response.transfer) {
-    percl.push({
-      OutDial: {
-        destination: response.transfer,
-        callConnectUrl: `${origin}/transfer`,
-      },
-    });
   }
 
   return percl;

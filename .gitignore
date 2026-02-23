@@ -5,3 +5,4 @@ dist/
 .dev.vars
 .zshrc-additions
 .DS_Store
+wrangler.log

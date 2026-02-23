@@ -30,7 +30,7 @@ let setupDone = false;
 function setup(env: Env): void {
   if (setupDone) return;
   toolRegistry.register(new WeatherTool());
-  toolRegistry.register(new CognosTool(env.COGNOS_PUBLIC_KEY));
+  toolRegistry.register(new CognosTool(env.COGNOS_PUBLIC_KEY, env.COGNOS));
   registry.register(new EchoApp());
   registry.register(new ClaudeAssistant(), true);
   setupDone = true;
@@ -79,7 +79,7 @@ export default {
         return new Response('Too many call attempts', { status: 429 });
       }
 
-      return handleIncomingCall(request, env);
+      return handleIncomingCall(request, env, ctx);
     }
 
     // FreeClimb conversation webhook - handles each turn of dialogue
@@ -204,7 +204,7 @@ export default {
           headers: { 'Content-Type': contentType },
         });
       } catch (err) {
-        console.error('ElevenLabs TTS error:', err);
+        console.error('TTS error:', err);
         return new Response('TTS generation failed', { status: 502 });
       }
     }
@@ -246,12 +246,10 @@ export default {
       const nextN = n + 1;
       const origin = new URL(request.url).origin;
 
-      // Poll up to 15 attempts (0ms, 500ms, 1000ms, ... 7000ms) for background TTS to finish.
-      // The filler phrase is short (~1.5s audio), so FreeClimb calls /continue well before the
-      // tool call + Claude pass 2 + background TTS completes (~4-6s). We need to hold the
-      // /continue request open long enough for those to finish.
+      // Poll up to 25 attempts (0ms, 500ms, ... 12s) for background TTS to finish.
+      // Cognos briefs take ~3-8s (upstream AI call + TTS), so 7.5s wasn't enough.
       let nextId: string | null = null;
-      for (let attempt = 0; attempt < 15; attempt++) {
+      for (let attempt = 0; attempt < 25; attempt++) {
         if (attempt > 0) await new Promise(r => setTimeout(r, 500));
         nextId = await env.RATE_LIMIT_KV.get(`${callKey}:${nextN}`);
         if (nextId) break;

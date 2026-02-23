@@ -72,7 +72,9 @@ const SYSTEM_PROMPT = `You are a helpful voice assistant. Your responses will be
 - Be friendly and helpful
 - When using tools, state the result once clearly — do not restate or paraphrase the same fact
 - Never repeat information you already said in a different form
-- Always use tools to fetch real-time data (weather, stocks, etc.) — even for follow-up questions about different locations or topics; never answer from training data when a tool is available`;
+- Use get_industry_brief when asked for a briefing, news, updates, or "what's new" about an industry topic — extract the specific topic from the caller's request
+- Use get_weather for weather questions
+- For general knowledge, conversation, or questions outside your tools' scope, answer directly from your own knowledge — you are not limited to tool-based answers`;
 
 // Phrases used for tool-call acknowledgments — randomized so repeat callers don't hear the same line
 export const FILLER_PHRASES = [
@@ -98,6 +100,26 @@ export const GOODBYE_PHRASES = [
 // In-memory Maps are scoped to a single isolate; KV is consistent regardless of which
 // isolate handles a given request, so context is never lost between call turns.
 const CONVERSATION_TTL_SECONDS = 15 * 60; // 15 minutes — longer than any realistic call
+
+/**
+ * Compress tool_result blocks in conversation history before saving.
+ * After Claude has consumed a tool result and generated its spoken summary,
+ * the raw data (800+ char cognos briefs, weather payloads) is dead weight.
+ * The assistant message that follows already captures what was communicated.
+ * Replacing verbose results with a short marker keeps token count bounded
+ * across many turns without losing conversational context.
+ */
+function compressToolResults(messages: Message[]): void {
+  for (const msg of messages) {
+    if (msg.role === 'user' && Array.isArray(msg.content)) {
+      for (const block of msg.content as ContentBlock[]) {
+        if (block.type === 'tool_result' && typeof block.content === 'string' && block.content.length > 120) {
+          block.content = block.content.slice(0, 80) + '… [truncated, see assistant summary above]';
+        }
+      }
+    }
+  }
+}
 
 async function getMessages(kv: KVNamespace, callId: string): Promise<Message[]> {
   const data = await kv.get(`conv:${callId}`, 'json') as Message[] | null;
@@ -146,6 +168,7 @@ export class ClaudeAssistant implements VoxnosApp {
 
     const assistantResponse = await this.callClaude(context, messages);
 
+    compressToolResults(messages);
     await saveMessages(context.env.RATE_LIMIT_KV, context.callId, messages);
 
     return {
@@ -193,6 +216,7 @@ export class ClaudeAssistant implements VoxnosApp {
       }
     }
 
+    compressToolResults(messages);
     await saveMessages(context.env.RATE_LIMIT_KV, context.callId, messages);
   }
 

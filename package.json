@@ -20,8 +20,5 @@
     "@types/node": "^22.10.5",
     "typescript": "^5.7.2",
     "wrangler": "^4.67.0"
-  },
-  "dependencies": {
-    "@supabase/supabase-js": "^2.47.10"
   }
 }

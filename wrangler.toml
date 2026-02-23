@@ -9,3 +9,7 @@ id = "58a6ac9954ea44d2972ba2cb9e1e077e"
 
 [vars]
 TTS_MODE = "google"
+
+[[services]]
+binding = "COGNOS"
+service = "jc-cognos"
