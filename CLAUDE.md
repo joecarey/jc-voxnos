@@ -2,6 +2,8 @@
 
 Multi-app voice platform: FreeClimb telephony + Claude Sonnet 4.6 + Google Chirp 3 HD TTS.
 
+**Response style**: No code snippets in explanations — describe changes in prose. Show diffs or code only when explicitly asked.
+
 **Call flow**: `/call` → App Router → `app.onStart()` greeting. `/conversation` → `app.onSpeech()` → Claude + tools → `streamSpeech()` → KV → Play commands.
 
 **Source**: `src/index.ts` (routing, /tts /tts-cache /continue), `src/routes.ts` (handleConversation, streaming V2), `src/apps/claude-assistant.ts` (default app), `src/tools/` (weather, cognos), `src/tts/` (google, elevenlabs, freeclimb providers), `src/percl/builder.ts`, `src/core/` (types, registry, auth, webhook-auth, rate-limit, env).
