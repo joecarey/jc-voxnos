@@ -1,4 +1,4 @@
-// Claude-powered voice assistant app with tool support
+// Ava — primary voice front-end to the Ava Platform
 
 import type { VoxnosApp, AppContext, SpeechInput, AppResponse, StreamChunk } from '../core/types.js';
 import { toolRegistry } from '../tools/registry.js';
@@ -64,36 +64,42 @@ function extractCompleteSentences(buffer: string): { complete: string[]; remaind
 
 const CLAUDE_MODEL = 'claude-sonnet-4-6';
 
-const SYSTEM_PROMPT = `You are a helpful voice assistant. Your responses will be converted to speech, so:
+const SYSTEM_PROMPT = `You are Ava, a personal voice assistant. You speak in a warm, familiar tone — like a trusted colleague, not a customer service bot. Your responses will be converted to speech, so:
 - Keep responses concise (1-2 sentences for simple answers, 3 max for complex ones)
-- Use natural, conversational language
+- Use natural, conversational language — contractions, informal phrasing
 - Avoid special characters, URLs, or formatting
 - If asked complex questions, summarize briefly and offer to elaborate
-- Be friendly and helpful
 - When using tools, state the result once clearly — do not restate or paraphrase the same fact
 - Never repeat information you already said in a different form
 - Use get_industry_brief when asked for a briefing, news, updates, or "what's new" about an industry topic — extract the specific topic from the caller's request
 - Use get_weather for weather questions
 - For general knowledge, conversation, or questions outside your tools' scope, answer directly from your own knowledge — you are not limited to tool-based answers`;
 
-// Phrases used for tool-call acknowledgments — randomized so repeat callers don't hear the same line
-export const FILLER_PHRASES = [
-  'One moment while I check on that.',
-  'Let me look that up for you.',
-  'Sure, let me find that information.',
-  'Just a second while I pull that up.',
-  'Hold on while I check on that.',
-  'Let me get that for you.',
+// Greetings — short, familiar, rotated randomly
+export const GREETING_PHRASES = [
+  'Hey. What can I get for you?',
+  'Hi. At your service.',
+  'Hey there. What do you need?',
+  "Hi. What's up?",
+  'Hey. Go ahead.',
 ];
 
-// Goodbye phrases — randomized for variety
+// Filler phrases for tool-call acknowledgments — short, familiar
+export const FILLER_PHRASES = [
+  'One sec.',
+  'On it.',
+  'Let me check.',
+  'Pulling that up.',
+  'Sure, one moment.',
+];
+
+// Goodbye phrases — short, warm
 export const GOODBYE_PHRASES = [
-  'Goodbye! Have a great day.',
-  'Great talking with you. Talk to you soon!',
-  'It was great chatting with you. Goodbye!',
-  'Hope I was helpful. Have a wonderful day!',
-  'Goodbye! Feel free to call back anytime.',
-  "Sure thing. I'm here if you need me.",
+  'Later. Call anytime.',
+  'Take care.',
+  'Alright, talk soon.',
+  "You got it. I'm here if you need me.",
+  'Bye for now.',
 ];
 
 // Conversation storage via KV — reliable across Cloudflare Worker isolates.
@@ -130,9 +136,10 @@ async function saveMessages(kv: KVNamespace, callId: string, messages: Message[]
   await kv.put(`conv:${callId}`, JSON.stringify(messages), { expirationTtl: CONVERSATION_TTL_SECONDS });
 }
 
-export class ClaudeAssistant implements VoxnosApp {
-  id = 'claude-assistant';
-  name = 'Claude Voice Assistant';
+export class AvaAssistant implements VoxnosApp {
+  id = 'ava';
+  name = 'Ava';
+  fillerPhrases = FILLER_PHRASES;
 
   async onStart(context: AppContext): Promise<AppResponse> {
     console.log(JSON.stringify({
@@ -143,9 +150,10 @@ export class ClaudeAssistant implements VoxnosApp {
       timestamp: new Date().toISOString(),
     }));
 
+    const idx = Math.floor(Math.random() * GREETING_PHRASES.length);
     return {
       speech: {
-        text: this.getTimeBasedGreeting(),
+        text: GREETING_PHRASES[idx],
       },
       prompt: true,
     };
@@ -506,24 +514,6 @@ export class ClaudeAssistant implements VoxnosApp {
       console.error('Error calling Claude API:', error);
       return 'I\'m experiencing technical difficulties. Please try again.';
     }
-  }
-
-  private getTimeBasedGreeting(): string {
-    // Get current time in Central Time (America/Chicago)
-    const now = new Date();
-    const centralTime = new Date(now.toLocaleString('en-US', { timeZone: 'America/Chicago' }));
-    const hour = centralTime.getHours();
-
-    let greeting: string;
-    if (hour >= 5 && hour < 12) {
-      greeting = 'Good morning';
-    } else if (hour >= 12 && hour < 18) {
-      greeting = 'Good afternoon';
-    } else {
-      greeting = 'Good evening';
-    }
-
-    return `${greeting}! How can I help you today?`;
   }
 
   private isGoodbye(text: string): boolean {

@@ -54,6 +54,10 @@ export interface VoxnosApp {
   id: string;            // Unique app identifier
   name: string;          // Human-readable name
 
+  // Short acknowledgment phrases played immediately on receipt of caller speech.
+  // Route layer picks one at random (coin flip) to fill dead air during API TTFB.
+  fillerPhrases?: string[];
+
   // Handle start of new call
   onStart(context: AppContext): Promise<AppResponse>;
 

@@ -2,7 +2,8 @@
 
 import { registry } from './core/registry.js';
 import { EchoApp } from './apps/echo.js';
-import { ClaudeAssistant } from './apps/claude-assistant.js';
+import { AvaAssistant } from './apps/ava.js';
+import { OttoAssistant } from './apps/otto.js';
 import type { Env } from './core/types.js';
 import { validateEnv, getEnvSetupInstructions } from './core/env.js';
 import { requireAdminAuth, createUnauthorizedResponse } from './core/auth.js';
@@ -32,7 +33,8 @@ function setup(env: Env): void {
   toolRegistry.register(new WeatherTool());
   toolRegistry.register(new CognosTool(env.COGNOS_PUBLIC_KEY, env.COGNOS));
   registry.register(new EchoApp());
-  registry.register(new ClaudeAssistant(), true);
+  registry.register(new OttoAssistant());
+  registry.register(new AvaAssistant(), true);
   setupDone = true;
 }
 
@@ -268,6 +270,16 @@ export default {
       if (!nextId) {
         // No more sentences — prompt caller for next input
         return Response.json([transcribeUtterance]);
+      }
+
+      // Check if processRemainingStream flagged this sentence as a hangup
+      const hangupAt = await env.RATE_LIMIT_KV.get(`${callKey}:hangup`);
+      if (hangupAt === String(nextN)) {
+        return Response.json([
+          { Play: { file: `${origin}/tts-cache?id=${nextId}` } },
+          { Pause: { length: 300 } },
+          { Hangup: {} },
+        ]);
       }
 
       const turnParam = turnId ? `&turn=${turnId}` : '';

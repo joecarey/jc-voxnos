@@ -23,17 +23,12 @@ const RETRY_PHRASES = [
 
 /**
  * Derive a stable, URL-safe KV cache key for a greeting phrase.
- * There are only ~3 variants (morning/afternoon/evening), so the key is
- * short and human-readable. Falls back to a sanitized prefix for any
- * other greeting text that gets added in the future.
+ * Greetings are short familiar phrases (~5 variants); the key is a
+ * sanitized slug of the text so each variant caches independently.
  */
 function greetingCacheKey(text: string, slug: string): string {
-  const lower = text.toLowerCase();
-  if (lower.includes('morning'))   return `greeting-morning-${slug}`;
-  if (lower.includes('afternoon')) return `greeting-afternoon-${slug}`;
-  if (lower.includes('evening'))   return `greeting-evening-${slug}`;
-  // Generic fallback: alphanumeric slug, max 40 chars
-  return 'greeting-' + lower.replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40) + `-${slug}`;
+  const key = text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
+  return `greeting-${key}-${slug}`;
 }
 
 function freeclimbAuth(env: Env): { auth: string; apiBase: string } {
@@ -146,20 +141,40 @@ export async function handleIncomingCall(request: Request, env: Env, ctx?: Execu
   }
 }
 
+// Probability of playing an immediate acknowledgment filler before Claude responds.
+// 0.5 = coin flip. Set to 0 to disable, 1 to always play.
+const PRE_FILLER_PROBABILITY = 0.5;
+
+/** Quick goodbye check at the route layer — mirrors the app's isGoodbye logic. */
+function looksLikeGoodbye(text: string): boolean {
+  const lower = text.toLowerCase();
+  return lower.includes('goodbye') || lower.includes('bye') ||
+         lower.includes('see you') || lower.includes('hang up') ||
+         lower === 'exit' || lower === 'quit';
+}
+
 /**
- * Background processor for sentences 2+ in the V2 streaming path.
- * Runs inside ctx.waitUntil() after routes.ts returns the first-sentence response.
+ * Background processor for streaming sentences.
+ * Runs inside ctx.waitUntil() after the route returns the first Play response.
  * Stores each sentence's audio in KV and marks the stream as done when finished.
+ *
+ * @param opts.skipFillers - When a pre-filler was already played at the route layer,
+ *   skip any filler chunks yielded by the app (identified by cacheKey starting with "filler-")
+ *   to avoid the caller hearing two fillers back-to-back.
+ * @param opts.onHangup - Called when a hangup chunk is encountered (e.g. goodbye).
+ *   Typically fires app.onEnd() for conversation cleanup.
  */
 async function processRemainingStream(
   sentenceStream: AsyncGenerator<StreamChunk, void, undefined>,
   callKey: string,
   env: Env,
   startIndex: number,
+  opts?: { skipFillers?: boolean; onHangup?: () => Promise<void> },
 ): Promise<void> {
   let n = startIndex;
   try {
     for await (const chunk of sentenceStream) {
+      if (opts?.skipFillers && chunk.cacheKey?.startsWith('filler-')) continue;
       n++;
       const safeSentence = sanitizeForTTS(chunk.text);
       if (!safeSentence) continue;
@@ -167,6 +182,13 @@ async function processRemainingStream(
       const id = crypto.randomUUID();
       await env.RATE_LIMIT_KV.put(`tts:${id}`, audio, { expirationTtl: 120 });
       await env.RATE_LIMIT_KV.put(`${callKey}:${n}`, id, { expirationTtl: 120 });
+
+      if (chunk.hangup) {
+        // Signal /continue to hang up after playing this sentence
+        await env.RATE_LIMIT_KV.put(`${callKey}:hangup`, String(n), { expirationTtl: 120 });
+        if (opts?.onHangup) await opts.onHangup();
+        break;
+      }
     }
   } catch (err) {
     console.error('processRemainingStream error:', err);
@@ -252,6 +274,40 @@ export async function handleConversation(
       const callKey = `stream:${context.callId}:${turnId}`;
 
       try {
+        // Pre-filler path: on a coin flip, play a short acknowledgment immediately
+        // and start the full Claude stream in the background. This fills the dead air
+        // during API TTFB (~1-2s). Skipped for goodbye inputs and apps without fillers.
+        const fillers = app.fillerPhrases;
+        const usePreFiller = fillers?.length && !looksLikeGoodbye(input.text) && Math.random() < PRE_FILLER_PROBABILITY;
+
+        if (usePreFiller) {
+          const fillerIdx = Math.floor(Math.random() * fillers.length);
+          const fillerText = fillers[fillerIdx];
+          const fillerId = `filler-${fillerIdx}-${voiceSlug(env)}`;
+
+          // Cache-first: filler audio is reused across calls
+          let fillerAudio = await env.RATE_LIMIT_KV.get(`tts:${fillerId}`, 'arrayBuffer');
+          if (!fillerAudio) {
+            fillerAudio = await callTTS(fillerText, env);
+            await env.RATE_LIMIT_KV.put(`tts:${fillerId}`, fillerAudio, { expirationTtl: 6 * 60 * 60 });
+          }
+
+          // Start the full stream in background — skipFillers prevents double-filler.
+          // onHangup covers the edge case where looksLikeGoodbye missed a goodbye intent.
+          const sentenceStream = app.streamSpeech(context, input);
+          const hangupCleanup = app.onEnd ? () => app.onEnd!(context) : undefined;
+          ctx.waitUntil(processRemainingStream(sentenceStream, callKey, env, 0, { skipFillers: true, onHangup: hangupCleanup }));
+
+          return Response.json(
+            [
+              { Play: { file: `${origin}/tts-cache?id=${fillerId}` } },
+              { Redirect: { actionUrl: `${origin}/continue?callId=${context.callId}&turn=${turnId}&n=0` } },
+            ],
+            { headers: { 'Content-Type': 'application/json' } },
+          );
+        }
+
+        // Standard streaming path: await first sentence from Claude, then background the rest
         const sentenceStream = app.streamSpeech(context, input);
         const firstResult = await sentenceStream.next();
 
@@ -291,7 +347,8 @@ export async function handleConversation(
             // Queue remaining sentences in background and start redirect chain.
             // /continue handles the case where there are no more sentences (returns TranscribeUtterance).
             await env.RATE_LIMIT_KV.put(`${callKey}:1`, s1Id, { expirationTtl: 120 });
-            ctx.waitUntil(processRemainingStream(sentenceStream, callKey, env, 1));
+            const hangupCleanup2 = app.onEnd ? () => app.onEnd!(context) : undefined;
+            ctx.waitUntil(processRemainingStream(sentenceStream, callKey, env, 1, { onHangup: hangupCleanup2 }));
 
             return Response.json(
               [
