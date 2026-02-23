@@ -116,10 +116,10 @@ Voice node of the Ava platform. Upstream: `jc-cognos` via `POST /brief`. Telepho
 
 **"Check recent logs"** → run `./scripts/logs.sh` (most recent call timeline) or `./scripts/logs.sh <callId>`.
 - `./scripts/logs.sh --raw` → raw FreeClimb JSON (pipe to `jq`)
-- `./scripts/logs.sh --tail` → live Cloudflare Worker `console.log` output (ctrl-c to stop)
+- `./scripts/logs.sh --tail` → live Cloudflare Worker `console.log` output via `wrangler tail` (real-time only, ctrl-c to stop)
 - Admin API key is read from `.dev.vars`, base URL is `https://jc-voxnos.cloudflare-5cf.workers.dev`
-- Worker logs (`console.log`) emit structured JSON events: `call_incoming`, `conversation_turn`, `pre_filler`, `continue_poll`, `no_input`, `claude_stream_complete`, `tool_execute`, `call_end`
-- FreeClimb logs (via `GET /logs`) show request/response bodies for every webhook exchange
+- **FreeClimb logs** (default mode, `GET /logs`): stored by FreeClimb, available after the fact — shows request/response bodies for every webhook exchange. This is the primary debugging tool.
+- **Cloudflare Worker logs** (`console.log`): only available live via `--tail` or historically via the Cloudflare dashboard (Workers & Pages → jc-voxnos → Logs). Structured JSON events: `call_incoming`, `conversation_turn`, `pre_filler`, `continue_poll`, `no_input`, `claude_stream_complete`, `tool_execute`, `call_end`
 - `rcrdTerminationSilenceTimeMs` max is 3000 (FreeClimb SDK ceiling)
 
 ## Deployment
