@@ -1,6 +1,6 @@
 // Environment variable validation
 
-import type { Env } from './types.js';
+import type { Env } from '../engine/types.js';
 
 /**
  * Required environment variables

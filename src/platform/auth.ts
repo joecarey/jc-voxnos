@@ -1,6 +1,6 @@
 // Admin authentication for voxnos platform
 
-import type { Env } from './types.js';
+import type { Env } from '../engine/types.js';
 
 export interface AuthResult {
   authorized: boolean;

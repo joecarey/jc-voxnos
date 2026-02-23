@@ -2,7 +2,7 @@
 // Dormant: registered but not routed to any FreeClimb number.
 // Preserved as a branch point for future work.
 
-import type { VoxnosApp, AppContext, SpeechInput, AppResponse, StreamChunk } from '../core/types.js';
+import type { VoxnosApp, AppContext, SpeechInput, AppResponse, StreamChunk } from '../engine/types.js';
 import { toolRegistry } from '../tools/registry.js';
 
 // Retryable HTTP status codes for Anthropic API calls

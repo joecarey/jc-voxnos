@@ -1,6 +1,6 @@
 // Echo App - Simple demo that repeats what the caller says
 
-import type { VoxnosApp, AppContext, SpeechInput, AppResponse } from '../core/types.js';
+import type { VoxnosApp, AppContext, SpeechInput, AppResponse } from '../engine/types.js';
 
 export class EchoApp implements VoxnosApp {
   id = 'echo';

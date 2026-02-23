@@ -1,8 +1,10 @@
 // FreeClimb PerCL command builder
 // Converts app responses into FreeClimb JSON commands
 
-import type { AppResponse } from '../core/types.js';
+import type { AppResponse } from '../engine/types.js';
 import type { TTSProvider, TTSEngineConfig } from '../tts/index.js';
+import { sanitizeForTTS } from '../tts/helpers.js';
+export { sanitizeForTTS };
 
 /**
  * FreeClimb PerCL command types
@@ -28,19 +30,6 @@ export interface PerCLCommand {
   Redirect?: {
     actionUrl: string;
   };
-}
-
-/**
- * Sanitize text before sending to TTS.
- * Strips SSML/HTML tags and entities that could cause unexpected TTS behavior
- * if injected via user speech → Claude response path.
- */
-export function sanitizeForTTS(text: string): string {
-  return text
-    .replace(/<[^>]+>/g, '')    // strip SSML/HTML tags
-    .replace(/&[a-z]+;/gi, '')  // strip HTML entities (&amp; &lt; etc.)
-    .trim()
-    .slice(0, 2000);            // cap length — FreeClimb Say has practical limits
 }
 
 /**

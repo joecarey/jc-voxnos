@@ -1,60 +1,23 @@
-// HTTP route handlers for voxnos platform
+// HTTP route handlers for voxnos platform.
+// FreeClimb-specific adapter: converts engine TurnResults into PerCL + TTS.
 
-import { registry } from './core/registry.js';
-import type { Env, AppContext, SpeechInput, StreamChunk } from './core/types.js';
-import { buildPerCL, sanitizeForTTS } from './percl/builder.js';
-import { DirectElevenLabsProvider, FreeClimbDefaultProvider, ELEVENLABS_VOICE_ID, callElevenLabs, callGoogleTTS, GOOGLE_TTS_VOICE } from './tts/index.js';
+import { registry } from '../engine/registry.js';
+import type { Env, AppContext, SpeechInput } from '../engine/types.js';
+import { processTurn } from '../engine/engine.js';
+import type { TurnResult } from '../engine/engine.js';
+import { buildPerCL, sanitizeForTTS } from './percl.js';
+import { voiceSlug, greetingCacheKey, callTTS, getTTSProvider } from '../tts/helpers.js';
+import { processRemainingStream } from '../tts/streaming.js';
 
-// Short voice identifier appended to all stable TTS cache keys.
-// When the voice changes, URLs change and FreeClimb's HTTP cache is automatically busted.
-// Derived per-mode so switching TTS_MODE invalidates the cache correctly.
-function voiceSlug(env: Env): string {
-  if (env.TTS_MODE === '11labs') return 'sarah';
-  return GOOGLE_TTS_VOICE.split('-').pop()!.toLowerCase(); // "despina"
-}
-
-// Phrases for when the caller's speech wasn't captured — randomized to avoid repetition
-const RETRY_PHRASES = [
-  "I didn't catch that. Could you please repeat?",
-  "Sorry, I missed that. Could you say it again?",
-  "I didn't quite hear you. Could you repeat that?",
-  "Pardon? Could you say that again?",
-];
-
-/**
- * Derive a stable, URL-safe KV cache key for a greeting phrase.
- * Greetings are short familiar phrases (~5 variants); the key is a
- * sanitized slug of the text so each variant caches independently.
- */
-function greetingCacheKey(text: string, slug: string): string {
-  const key = text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
-  return `greeting-${key}-${slug}`;
-}
+// Probability of playing an immediate acknowledgment filler before Claude responds.
+// 0.5 = coin flip. Set to 0 to disable, 1 to always play.
+const PRE_FILLER_PROBABILITY = 0.5;
 
 function freeclimbAuth(env: Env): { auth: string; apiBase: string } {
   return {
     auth: btoa(`${env.FREECLIMB_ACCOUNT_ID}:${env.FREECLIMB_API_KEY}`),
     apiBase: 'https://www.freeclimb.com/apiserver',
   };
-}
-
-function getTTSProvider(env: Env) {
-  if (env.TTS_MODE === '11labs') {
-    return new DirectElevenLabsProvider({
-      voiceId: ELEVENLABS_VOICE_ID,
-      signingSecret: env.TTS_SIGNING_SECRET,
-    });
-  }
-  // google and all other modes: FreeClimbDefaultProvider is the safe fallback
-  // for the non-streaming buildPerCL path (not reached when streamSpeech is active)
-  return new FreeClimbDefaultProvider();
-}
-
-function callTTS(text: string, env: Env): Promise<ArrayBuffer> {
-  if (env.TTS_MODE === 'google') {
-    return callGoogleTTS(text, env.GOOGLE_TTS_API_KEY!);
-  }
-  return callElevenLabs(text, env.ELEVENLABS_API_KEY!, undefined, env.ELEVENLABS_BASE_URL);
 }
 
 /**
@@ -93,8 +56,7 @@ export async function handleIncomingCall(request: Request, env: Env, ctx?: Execu
     const response = await app.onStart(context);
 
     // For direct TTS modes (google, 11labs), pre-generate greeting audio and use Play instead of Say.
-    // Greetings are one of ~3 fixed strings (morning/afternoon/evening), so we cache them with a
-    // stable KV key and a long TTL to avoid re-generating the same audio on every call.
+    // Greetings are one of ~5 fixed strings; we cache them with a stable KV key and long TTL.
     // If TTS generation fails, falls through to buildPerCL which uses FreeClimb Say as fallback.
     if ((env.TTS_MODE === 'google' || env.TTS_MODE === '11labs') && response.speech?.text) {
       const safeText = sanitizeForTTS(response.speech.text);
@@ -141,69 +103,10 @@ export async function handleIncomingCall(request: Request, env: Env, ctx?: Execu
   }
 }
 
-// Probability of playing an immediate acknowledgment filler before Claude responds.
-// 0.5 = coin flip. Set to 0 to disable, 1 to always play.
-const PRE_FILLER_PROBABILITY = 0.5;
-
-/** Quick goodbye check at the route layer — mirrors the app's isGoodbye logic. */
-function looksLikeGoodbye(text: string): boolean {
-  const lower = text.toLowerCase();
-  return lower.includes('goodbye') || lower.includes('bye') ||
-         lower.includes('see you') || lower.includes('hang up') ||
-         lower === 'exit' || lower === 'quit';
-}
-
 /**
- * Background processor for streaming sentences.
- * Runs inside ctx.waitUntil() after the route returns the first Play response.
- * Stores each sentence's audio in KV and marks the stream as done when finished.
- *
- * @param opts.skipFillers - When a pre-filler was already played at the route layer,
- *   skip any filler chunks yielded by the app (identified by cacheKey starting with "filler-")
- *   to avoid the caller hearing two fillers back-to-back.
- * @param opts.onHangup - Called when a hangup chunk is encountered (e.g. goodbye).
- *   Typically fires app.onEnd() for conversation cleanup.
- */
-async function processRemainingStream(
-  sentenceStream: AsyncGenerator<StreamChunk, void, undefined>,
-  callKey: string,
-  env: Env,
-  startIndex: number,
-  opts?: { skipFillers?: boolean; onHangup?: () => Promise<void> },
-): Promise<void> {
-  // Signal /continue that the stream is alive — without this marker, /continue
-  // can't distinguish "stream hasn't produced anything yet" from "stream is done"
-  // and may return TranscribeUtterance prematurely (e.g. during slow cognos calls).
-  await env.RATE_LIMIT_KV.put(`${callKey}:pending`, '1', { expirationTtl: 120 });
-
-  let n = startIndex;
-  try {
-    for await (const chunk of sentenceStream) {
-      if (opts?.skipFillers && chunk.cacheKey?.startsWith('filler-')) continue;
-      n++;
-      const safeSentence = sanitizeForTTS(chunk.text);
-      if (!safeSentence) continue;
-      const audio = await callTTS(safeSentence, env);
-      const id = crypto.randomUUID();
-      await env.RATE_LIMIT_KV.put(`tts:${id}`, audio, { expirationTtl: 120 });
-      await env.RATE_LIMIT_KV.put(`${callKey}:${n}`, id, { expirationTtl: 120 });
-
-      if (chunk.hangup) {
-        // Signal /continue to hang up after playing this sentence
-        await env.RATE_LIMIT_KV.put(`${callKey}:hangup`, String(n), { expirationTtl: 120 });
-        if (opts?.onHangup) await opts.onHangup();
-        break;
-      }
-    }
-  } catch (err) {
-    console.error('processRemainingStream error:', err);
-  } finally {
-    await env.RATE_LIMIT_KV.put(`${callKey}:done`, '1', { expirationTtl: 120 });
-  }
-}
-
-/**
- * FreeClimb conversation webhook - handles each turn of dialogue
+ * FreeClimb conversation webhook - handles each turn of dialogue.
+ * Delegates turn-level decisions to the conversation engine, then converts
+ * the platform-neutral TurnResult into FreeClimb PerCL + TTS.
  */
 export async function handleConversation(
   request: Request,
@@ -233,7 +136,7 @@ export async function handleConversation(
       return Response.json([{ Hangup: {} }]);
     }
 
-    // Build context
+    // Build context and input
     const context: AppContext = {
       env,
       callId: body.callId,
@@ -241,144 +144,54 @@ export async function handleConversation(
       to: body.to,
     };
 
-    // Build speech input from transcription
     const input: SpeechInput = {
       text: body.transcript ?? '',
       confidence: undefined,  // FreeClimb doesn't provide confidence in TranscribeUtterance
     };
 
-    // If no transcription, ask to repeat using a cached Play (same voice as the rest of the call)
-    if (!input.text || input.text.trim() === '') {
+    // --- Engine: decide what happens this turn ---
+    const streaming = (env.TTS_MODE === 'google' || env.TTS_MODE === '11labs') && !!ctx;
+    const result: TurnResult = await processTurn(app, context, input, {
+      streaming,
+      preFillerProbability: PRE_FILLER_PROBABILITY,
+    });
+
+    const origin = new URL(request.url).origin;
+
+    // --- FreeClimb adapter: convert TurnResult to PerCL ---
+
+    if (result.type === 'no-input') {
       console.log(JSON.stringify({ event: 'no_input', callId: body.callId, transcribeReason: body.transcribeReason, timestamp: new Date().toISOString() }));
-      const origin = new URL(request.url).origin;
-      const retryIdx = Math.floor(Math.random() * RETRY_PHRASES.length);
-      const retryText = RETRY_PHRASES[retryIdx];
-      const retryCacheKey = `retry-${retryIdx}-${voiceSlug(env)}`;
-      let retryAudio = await env.RATE_LIMIT_KV.get(`tts:${retryCacheKey}`, 'arrayBuffer');
-      if (!retryAudio) {
-        retryAudio = await callTTS(retryText, env);
-        await env.RATE_LIMIT_KV.put(`tts:${retryCacheKey}`, retryAudio, { expirationTtl: 6 * 60 * 60 });
-      }
-      return Response.json([
-        { Play: { file: `${origin}/tts-cache?id=${retryCacheKey}` } },
-        {
-          TranscribeUtterance: {
-            actionUrl: `${origin}/conversation`,
-            playBeep: false,
-            record: { maxLengthSec: 25, rcrdTerminationSilenceTimeMs: 3000 },
-          },
-        },
-      ], { headers: { 'Content-Type': 'application/json' } });
+      return handleNoInputResponse(result.retryPhrase, origin, env);
     }
 
-    // V2: streaming path — first sentence TTS'd immediately, rest processed in background
-    if ((env.TTS_MODE === 'google' || env.TTS_MODE === '11labs') && ctx && app.streamSpeech) {
-      const origin = new URL(request.url).origin;
-      // Per-turn UUID prevents stale KV reads: each conversation turn gets its own
-      // namespace so /continue never picks up sentence-2+ entries from a prior turn.
+    if (result.type === 'stream') {
+      // Per-turn UUID prevents stale KV reads
       const turnId = crypto.randomUUID();
       const callKey = `stream:${context.callId}:${turnId}`;
 
       try {
-        // Pre-filler path: on a coin flip, play a short acknowledgment immediately
-        // and start the full Claude stream in the background. This fills the dead air
-        // during API TTFB (~1-2s). Skipped for goodbye inputs and apps without fillers.
-        const fillers = app.fillerPhrases;
-        const usePreFiller = fillers?.length && !looksLikeGoodbye(input.text) && Math.random() < PRE_FILLER_PROBABILITY;
-
-        if (usePreFiller) {
-          console.log(JSON.stringify({ event: 'pre_filler', callId: context.callId, turnId, timestamp: new Date().toISOString() }));
-          const fillerIdx = Math.floor(Math.random() * fillers.length);
-          const fillerText = fillers[fillerIdx];
-          const fillerId = `filler-${fillerIdx}-${voiceSlug(env)}`;
-
-          // Cache-first: filler audio is reused across calls
-          let fillerAudio = await env.RATE_LIMIT_KV.get(`tts:${fillerId}`, 'arrayBuffer');
-          if (!fillerAudio) {
-            fillerAudio = await callTTS(fillerText, env);
-            await env.RATE_LIMIT_KV.put(`tts:${fillerId}`, fillerAudio, { expirationTtl: 6 * 60 * 60 });
-          }
-
-          // Start the full stream in background — skipFillers prevents double-filler.
-          // onHangup covers the edge case where looksLikeGoodbye missed a goodbye intent.
-          const sentenceStream = app.streamSpeech(context, input);
-          const hangupCleanup = app.onEnd ? () => app.onEnd!(context) : undefined;
-          ctx.waitUntil(processRemainingStream(sentenceStream, callKey, env, 0, { skipFillers: true, onHangup: hangupCleanup }));
-
-          return Response.json(
-            [
-              { Play: { file: `${origin}/tts-cache?id=${fillerId}` } },
-              { Redirect: { actionUrl: `${origin}/continue?callId=${context.callId}&turn=${turnId}&n=0` } },
-            ],
-            { headers: { 'Content-Type': 'application/json' } },
-          );
+        if (result.preFiller) {
+          return await handlePreFillerStream(result, context, turnId, callKey, origin, env, ctx!);
         }
-
-        // Standard streaming path: await first sentence from Claude, then background the rest
-        const sentenceStream = app.streamSpeech(context, input);
-        const firstResult = await sentenceStream.next();
-
-        if (!firstResult.done) {
-          const chunk1 = firstResult.value;
-          const safeSentence1 = sanitizeForTTS(chunk1.text);
-
-          if (safeSentence1) {
-            // If the chunk has a stable cache key (filler/goodbye phrase), use cache-first with long TTL.
-            // Otherwise generate fresh audio with a UUID and short TTL.
-            let s1Audio: ArrayBuffer;
-            let s1Id: string;
-            if (chunk1.cacheKey) {
-              s1Id = `${chunk1.cacheKey}-${voiceSlug(env)}`;
-              const cached = await env.RATE_LIMIT_KV.get(`tts:${s1Id}`, 'arrayBuffer');
-              if (cached) {
-                s1Audio = cached;
-              } else {
-                s1Audio = await callTTS(safeSentence1, env);
-                await env.RATE_LIMIT_KV.put(`tts:${s1Id}`, s1Audio, { expirationTtl: 6 * 60 * 60 });
-              }
-            } else {
-              s1Id = crypto.randomUUID();
-              s1Audio = await callTTS(safeSentence1, env);
-              await env.RATE_LIMIT_KV.put(`tts:${s1Id}`, s1Audio, { expirationTtl: 120 });
-            }
-
-            if (chunk1.hangup) {
-              // Generator signaled hangup — brief pause so goodbye doesn't cut off abruptly
-              if (app.onEnd) ctx.waitUntil(app.onEnd(context));
-              return Response.json(
-                [{ Play: { file: `${origin}/tts-cache?id=${s1Id}` } }, { Pause: { length: 300 } }, { Hangup: {} }],
-                { headers: { 'Content-Type': 'application/json' } },
-              );
-            }
-
-            // Queue remaining sentences in background and start redirect chain.
-            // /continue handles the case where there are no more sentences (returns TranscribeUtterance).
-            await env.RATE_LIMIT_KV.put(`${callKey}:1`, s1Id, { expirationTtl: 120 });
-            const hangupCleanup2 = app.onEnd ? () => app.onEnd!(context) : undefined;
-            ctx.waitUntil(processRemainingStream(sentenceStream, callKey, env, 1, { onHangup: hangupCleanup2 }));
-
-            return Response.json(
-              [
-                { Play: { file: `${origin}/tts-cache?id=${s1Id}` } },
-                { Redirect: { actionUrl: `${origin}/continue?callId=${context.callId}&turn=${turnId}&n=1` } },
-              ],
-              { headers: { 'Content-Type': 'application/json' } },
-            );
-          }
-        }
+        return await handleStandardStream(result, context, turnId, callKey, origin, env, ctx!);
       } catch (streamErr) {
         console.error('Streaming path error, falling back to non-streaming:', streamErr);
+        // Fall through to non-streaming below
       }
+
+      // Streaming failed — fall back to non-streaming via onSpeech
+      const fallback = await app.onSpeech(context, input);
+      const percl = await buildPerCL(fallback, request.url, getTTSProvider(env));
+      if (fallback.hangup && result.cleanup && ctx) ctx.waitUntil(result.cleanup());
+      return Response.json(percl, { headers: { 'Content-Type': 'application/json' } });
     }
 
-    // Standard (non-streaming) path
-    const response = await app.onSpeech(context, input);
+    // type === 'response' — non-streaming path
+    const percl = await buildPerCL(result.speech, request.url, getTTSProvider(env));
 
-    // Convert to PerCL
-    const percl = await buildPerCL(response, request.url, getTTSProvider(env));
-
-    if (response.hangup && app.onEnd && ctx) {
-      ctx.waitUntil(app.onEnd(context));
+    if (result.cleanup && ctx) {
+      ctx.waitUntil(result.cleanup());
     }
 
     return Response.json(percl, {
@@ -391,6 +204,131 @@ export async function handleConversation(
       { Hangup: {} },
     ], { status: 500 });
   }
+}
+
+// --- FreeClimb-specific delivery helpers ---
+
+/** Handle no-input: play cached retry phrase + TranscribeUtterance. */
+async function handleNoInputResponse(
+  retryPhrase: string,
+  origin: string,
+  env: Env,
+): Promise<Response> {
+  // Use a stable cache key based on the phrase content for consistent TTS caching
+  const phraseKey = retryPhrase.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
+  const retryCacheKey = `retry-${phraseKey}-${voiceSlug(env)}`;
+  let retryAudio = await env.RATE_LIMIT_KV.get(`tts:${retryCacheKey}`, 'arrayBuffer');
+  if (!retryAudio) {
+    retryAudio = await callTTS(retryPhrase, env);
+    await env.RATE_LIMIT_KV.put(`tts:${retryCacheKey}`, retryAudio, { expirationTtl: 6 * 60 * 60 });
+  }
+  return Response.json([
+    { Play: { file: `${origin}/tts-cache?id=${retryCacheKey}` } },
+    {
+      TranscribeUtterance: {
+        actionUrl: `${origin}/conversation`,
+        playBeep: false,
+        record: { maxLengthSec: 25, rcrdTerminationSilenceTimeMs: 3000 },
+      },
+    },
+  ], { headers: { 'Content-Type': 'application/json' } });
+}
+
+/** Handle pre-filler streaming: play cached filler immediately, full stream in background. */
+async function handlePreFillerStream(
+  result: Extract<TurnResult, { type: 'stream' }>,
+  context: AppContext,
+  turnId: string,
+  callKey: string,
+  origin: string,
+  env: Env,
+  ctx: ExecutionContext,
+): Promise<Response> {
+  const { preFiller, stream, skipFillers, cleanup } = result;
+  console.log(JSON.stringify({ event: 'pre_filler', callId: context.callId, turnId, timestamp: new Date().toISOString() }));
+  const fillerId = `filler-${preFiller!.fillerIndex}-${voiceSlug(env)}`;
+
+  // Cache-first: filler audio is reused across calls
+  let fillerAudio = await env.RATE_LIMIT_KV.get(`tts:${fillerId}`, 'arrayBuffer');
+  if (!fillerAudio) {
+    fillerAudio = await callTTS(preFiller!.phrase, env);
+    await env.RATE_LIMIT_KV.put(`tts:${fillerId}`, fillerAudio, { expirationTtl: 6 * 60 * 60 });
+  }
+
+  // Start the full stream in background — skipFillers prevents double-filler
+  ctx.waitUntil(processRemainingStream(stream, callKey, env, 0, { skipFillers, onHangup: cleanup }));
+
+  return Response.json(
+    [
+      { Play: { file: `${origin}/tts-cache?id=${fillerId}` } },
+      { Redirect: { actionUrl: `${origin}/continue?callId=${context.callId}&turn=${turnId}&n=0` } },
+    ],
+    { headers: { 'Content-Type': 'application/json' } },
+  );
+}
+
+/** Handle standard streaming: await first sentence, TTS it, background the rest. */
+async function handleStandardStream(
+  result: Extract<TurnResult, { type: 'stream' }>,
+  context: AppContext,
+  turnId: string,
+  callKey: string,
+  origin: string,
+  env: Env,
+  ctx: ExecutionContext,
+): Promise<Response> {
+  const { stream, cleanup } = result;
+  const firstResult = await stream.next();
+
+  if (!firstResult.done) {
+    const chunk1 = firstResult.value;
+    const safeSentence1 = sanitizeForTTS(chunk1.text);
+
+    if (safeSentence1) {
+      // If the chunk has a stable cache key (filler/goodbye phrase), use cache-first with long TTL.
+      // Otherwise generate fresh audio with a UUID and short TTL.
+      let s1Audio: ArrayBuffer;
+      let s1Id: string;
+      if (chunk1.cacheKey) {
+        s1Id = `${chunk1.cacheKey}-${voiceSlug(env)}`;
+        const cached = await env.RATE_LIMIT_KV.get(`tts:${s1Id}`, 'arrayBuffer');
+        if (cached) {
+          s1Audio = cached;
+        } else {
+          s1Audio = await callTTS(safeSentence1, env);
+          await env.RATE_LIMIT_KV.put(`tts:${s1Id}`, s1Audio, { expirationTtl: 6 * 60 * 60 });
+        }
+      } else {
+        s1Id = crypto.randomUUID();
+        s1Audio = await callTTS(safeSentence1, env);
+        await env.RATE_LIMIT_KV.put(`tts:${s1Id}`, s1Audio, { expirationTtl: 120 });
+      }
+
+      if (chunk1.hangup) {
+        // Generator signaled hangup — brief pause so goodbye doesn't cut off abruptly
+        if (cleanup) ctx.waitUntil(cleanup());
+        return Response.json(
+          [{ Play: { file: `${origin}/tts-cache?id=${s1Id}` } }, { Pause: { length: 300 } }, { Hangup: {} }],
+          { headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+
+      // Queue remaining sentences in background and start redirect chain
+      await env.RATE_LIMIT_KV.put(`${callKey}:1`, s1Id, { expirationTtl: 120 });
+      ctx.waitUntil(processRemainingStream(stream, callKey, env, 1, { onHangup: cleanup }));
+
+      return Response.json(
+        [
+          { Play: { file: `${origin}/tts-cache?id=${s1Id}` } },
+          { Redirect: { actionUrl: `${origin}/continue?callId=${context.callId}&turn=${turnId}&n=1` } },
+        ],
+        { headers: { 'Content-Type': 'application/json' } },
+      );
+    }
+  }
+
+  // Stream produced nothing — fall through handled by caller
+  throw new Error('Stream produced no usable content');
 }
 
 /**

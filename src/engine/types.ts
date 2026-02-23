@@ -14,6 +14,7 @@ export interface Env {
   TTS_MODE?: string;  // 'freeclimb' (default) | '11labs' | 'google'
   COGNOS_PUBLIC_KEY: string;
   COGNOS: Fetcher;  // Service binding to jc-cognos Worker
+  DB?: D1Database;  // D1 database for persistent survey results (optional — KV fallback if absent)
 }
 
 export interface AppContext {
@@ -57,6 +58,10 @@ export interface VoxnosApp {
   // Short acknowledgment phrases played immediately on receipt of caller speech.
   // Route layer picks one at random (coin flip) to fill dead air during API TTFB.
   fillerPhrases?: string[];
+
+  // Phrases used when the caller says nothing (empty transcript).
+  // Engine picks one at random. Falls back to default retry phrases if not set.
+  retryPhrases?: string[];
 
   // Handle start of new call
   onStart(context: AppContext): Promise<AppResponse>;

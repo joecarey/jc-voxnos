@@ -10,6 +10,11 @@ id = "58a6ac9954ea44d2972ba2cb9e1e077e"
 [vars]
 TTS_MODE = "google"
 
+[[d1_databases]]
+binding = "DB"
+database_name = "jc-voxnos-surveys"
+database_id = "131ed879-edf4-414c-83c7-c76fa5ede37c"
+
 [[services]]
 binding = "COGNOS"
 service = "jc-cognos"

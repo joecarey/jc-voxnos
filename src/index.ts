@@ -1,17 +1,19 @@
 // Voxnos - Platform for building speech-enabled voice applications
 
-import { registry } from './core/registry.js';
+import { registry } from './engine/registry.js';
 import { EchoApp } from './apps/echo.js';
 import { AvaAssistant } from './apps/ava.js';
+import { RitaAssistant } from './apps/rita.js';
 import { OttoAssistant } from './apps/otto.js';
-import type { Env } from './core/types.js';
-import { validateEnv, getEnvSetupInstructions } from './core/env.js';
-import { requireAdminAuth, createUnauthorizedResponse } from './core/auth.js';
-import { validateWebhook, createWebhookUnauthorizedResponse } from './core/webhook-auth.js';
+import { CocoSurvey } from './apps/coco.js';
+import type { Env } from './engine/types.js';
+import { validateEnv, getEnvSetupInstructions } from './platform/env.js';
+import { requireAdminAuth, createUnauthorizedResponse } from './platform/auth.js';
+import { validateWebhook, createWebhookUnauthorizedResponse } from './platform/webhook-auth.js';
 import { toolRegistry } from './tools/registry.js';
 import { WeatherTool } from './tools/weather.js';
 import { CognosTool } from './tools/cognos.js';
-import { checkRateLimit, getIPFromRequest, RATE_LIMITS } from './core/rate-limit.js';
+import { checkRateLimit, getIPFromRequest, RATE_LIMITS } from './platform/rate-limit.js';
 import {
   handleIncomingCall,
   handleConversation,
@@ -23,7 +25,8 @@ import {
   handleUpdatePhoneNumber,
   handleGetLogs,
   handleUpdateApplication,
-} from './routes.js';
+} from './telephony/routes.js';
+import { listSurveyResults, getSurveyResult } from './services/survey-store.js';
 import { callElevenLabs, callGoogleTTS, computeTtsSignature } from './tts/index.js';
 
 // Deferred setup — runs once per isolate on first request so env is available.
@@ -34,6 +37,8 @@ function setup(env: Env): void {
   toolRegistry.register(new CognosTool(env.COGNOS_PUBLIC_KEY, env.COGNOS));
   registry.register(new EchoApp());
   registry.register(new OttoAssistant());
+  registry.register(new RitaAssistant());
+  registry.register(new CocoSurvey());
   registry.register(new AvaAssistant(), true);
   setupDone = true;
 }
@@ -172,6 +177,37 @@ export default {
         days.push({ date, input_tokens: val?.input_tokens ?? 0, output_tokens: val?.output_tokens ?? 0, requests: val?.requests ?? 0 });
       }
       return Response.json({ service: 'voxnos', days });
+    }
+
+    // Survey results — single result by ID (must match before the list route)
+    if (url.pathname.startsWith('/survey-results/') && request.method === 'GET') {
+      const denied = await requireAdmin(request, env);
+      if (denied) return denied;
+      if (!env.DB) return Response.json({ error: 'D1 not configured' }, { status: 501 });
+
+      const idStr = url.pathname.split('/')[2];
+      const id = parseInt(idStr, 10);
+      if (isNaN(id)) return Response.json({ error: 'Invalid ID' }, { status: 400 });
+
+      const result = await getSurveyResult(env.DB, id);
+      if (!result) return Response.json({ error: 'Not found' }, { status: 404 });
+      return Response.json(result);
+    }
+
+    // Survey results — list with optional filters
+    if (url.pathname === '/survey-results' && request.method === 'GET') {
+      const denied = await requireAdmin(request, env);
+      if (denied) return denied;
+      if (!env.DB) return Response.json({ error: 'D1 not configured' }, { status: 501 });
+
+      const surveyId = url.searchParams.get('survey') ?? undefined;
+      const from = url.searchParams.get('from') ?? undefined;
+      const to = url.searchParams.get('to') ?? undefined;
+      const limit = url.searchParams.has('limit') ? parseInt(url.searchParams.get('limit')!, 10) : undefined;
+      const offset = url.searchParams.has('offset') ? parseInt(url.searchParams.get('offset')!, 10) : undefined;
+
+      const results = await listSurveyResults(env.DB, { surveyId, from, to, limit, offset });
+      return Response.json({ results, count: results.length });
     }
 
     // On-demand TTS endpoint — called by FreeClimb Play command (TTS_MODE=google|11labs)
