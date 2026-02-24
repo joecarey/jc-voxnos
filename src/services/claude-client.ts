@@ -179,7 +179,7 @@ export async function* streamClaude(
       const toolResults: ContentBlock[] = [];
       for (const tool of toolUseBlocks) {
         console.log(JSON.stringify({ event: 'tool_execute', callId: context.callId, tool: tool.name, timestamp: new Date().toISOString() }));
-        const result = await toolRegistry.execute(tool.name, tool.input);
+        const result = await toolRegistry.execute(tool.name, tool.input, { callId: context.callId, env: context.env });
         toolResults.push({ type: 'tool_result', tool_use_id: tool.id, content: result });
       }
 
@@ -276,7 +276,7 @@ export async function callClaude(
           assistantContent.push(block);
 
           console.log(JSON.stringify({ event: 'tool_execute', callId: context.callId, tool: block.name, timestamp: new Date().toISOString() }));
-          const toolResult = await toolRegistry.execute(block.name!, block.input!);
+          const toolResult = await toolRegistry.execute(block.name!, block.input!, { callId: context.callId, env: context.env });
 
           toolResults.push({
             type: 'tool_result',

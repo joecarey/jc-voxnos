@@ -14,7 +14,7 @@ Multi-app voice platform: FreeClimb telephony + Claude Sonnet 4.6 + Google Chirp
 - `src/platform/` — HTTP infrastructure (auth, webhook-auth, rate-limit, env)
 - `src/apps/` — concrete app instances (ava, rita, otto, echo)
 - `src/tts/` — TTS providers (google, elevenlabs, freeclimb, helpers, streaming)
-- `src/tools/` — tool system (registry, weather, cognos)
+- `src/tools/` — tool system (registry, weather, cognos, transfer)
 
 ## App Type Hierarchy
 
@@ -36,7 +36,8 @@ VoxnosApp (interface — platform contract)
 
 ### Dynamic (D1-driven — `app_definitions` table)
 Loaded from `app_definitions` table at Worker startup. Each active row becomes a `ConversationalApp` or `SurveyApp` instance registered with `{ dynamic: true }`. Managed via `POST /apps/definitions`, `DELETE /apps/definitions/:id`, `POST /reload-apps`.
-- `ava` — **default** — ConversationalApp, Claude Sonnet 4.6, tools (weather + cognos), streaming TTS. Warm/familiar personality, informal greetings, short fillers.
+- `river` — **default** — ConversationalApp, intent router. Greets callers, classifies intent via Claude, transfers to the right app using `transfer_to_app` tool. No other tools — never answers questions directly.
+- `ava` — ConversationalApp, Claude Sonnet 4.6, tools (weather + cognos), streaming TTS. Warm/familiar personality, informal greetings, short fillers.
 - `rita` — ConversationalApp, neutral/professional personality, tools (weather + cognos).
 - `coco` — SurveyApp, 3-question CX demo (satisfaction/scale, recommend/yes_no, feedback/open)
 
@@ -44,6 +45,13 @@ Loaded from `app_definitions` table at Worker startup. Each active row becomes a
 
 ### Phone Routing
 `phone_routes` table maps phone numbers (E.164) to app IDs. Loaded at startup. `registry.getForNumber()` checks routes first, falls back to the default app. Managed via `POST /phone-routes`, `DELETE /phone-routes/:phoneNumber`.
+
+### Internal Call Transfer
+Apps can transfer a call to another app mid-session using the `transfer_to_app` tool. The tool writes two KV keys: `call-app:{callId}` → `{appId}` (durable override, written once) and `call-app:{callId}:pending` → `1` (one-shot flag). Optionally writes a third key `call-transfer-context:{callId}` with JSON `{ intent }` when `caller_intent` is provided (warm transfer). Two-key design avoids KV eventual-consistency races — the app override is never rewritten. Cleaned up in `BaseApp.onEnd()`.
+
+**Cold transfer** (no intent or target is SurveyApp): route handler calls `onStart()` on the target app, delivers its greeting. Same as a fresh call.
+
+**Warm transfer** (intent present + target has `streamSpeech`): route handler skips `onStart()`, injects the caller's intent as a synthetic `SpeechInput`, and falls through to normal `processTurn()`. The target app's Claude sees the intent as the first user message and responds directly — no greeting, no repeat. Normal streaming and pre-filler infrastructure kicks in.
 
 ## HTTP Endpoints
 
@@ -102,6 +110,9 @@ Loaded from `app_definitions` table at Worker startup. Each active row becomes a
 | `stream:{callId}:{turnId}:done` | `'1'` | 120s | stream completion signal |
 | `stream:{callId}:{turnId}:hangup` | sentence index string | 120s | hangup marker for /continue |
 | `conv:{callId}` | JSON messages | 15min | conversation history |
+| `call-app:{callId}` | app ID string | 15min | durable per-call app override for internal transfers |
+| `call-app:{callId}:pending` | `'1'` | 15min | one-shot transfer greeting flag (deleted after delivery) |
+| `call-transfer-context:{callId}` | JSON `{ intent }` | 15min | warm transfer context (caller's request summary) |
 | `rl:{prefix}:{id}:{bucket}` | count string | 120s | rate limiting |
 | `costs:voxnos:{date}` | JSON token counts | 90d | cost tracking |
 | `survey:{callId}` | JSON survey state | 15min | in-flight survey progress (question index + answers) |
@@ -185,7 +196,7 @@ Written at call start (`createCallRecord`), finalized at hangup/goodbye (`endCal
 | `content` | TEXT | The actual text spoken (transcript or TTS text) |
 | `meta` | TEXT | Optional JSON blob for structured data |
 
-**Turn types**: `greeting` (system greeting), `caller_speech` (transcribed input), `assistant_response` (Claude's full text reply, all sentences joined), `filler` (acknowledgment phrase), `no_input` (caller said nothing, retry played), `goodbye` (farewell, call ending), `tool_use`, `error`.
+**Turn types**: `greeting` (system greeting), `caller_speech` (transcribed input), `assistant_response` (Claude's full text reply, all sentences joined), `filler` (acknowledgment phrase), `no_input` (caller said nothing, retry played), `goodbye` (farewell, call ending), `transfer` (internal app handoff, meta: `{to_app}`), `tool_use`, `error`.
 
 CDR turns are written fire-and-forget at each event point in the route handler. Streaming responses are collected via `onStreamComplete` callback and written as a single `assistant_response` turn when the stream finishes.
 
@@ -221,7 +232,7 @@ Routes pattern-match on `TurnResult.type` to produce FreeClimb PerCL + TTS. The 
 
 - **`types.ts`** — `Env`, `AppContext`, `SpeechInput`, `AppResponse`, `StreamChunk`, `VoxnosApp` interface.
 - **`engine.ts`** — Conversation engine. `processTurn()`, `TurnResult` type, `DEFAULT_RETRY_PHRASES`. Decides no-input/streaming/pre-filler per turn.
-- **`base-app.ts`** — `BaseApp` abstract class implementing `VoxnosApp`. Handles call lifecycle logging (`call_start`/`call_end`), KV cleanup in `onEnd`. Exposes `fillerPhrases` and `retryPhrases`. Subclasses implement `getGreeting()` and `onSpeech()`.
+- **`base-app.ts`** — `BaseApp` abstract class implementing `VoxnosApp`. Handles call lifecycle logging (`call_start`/`call_end`), KV cleanup in `onEnd` (`conv:{callId}`, `call-app:{callId}`, `call-app:{callId}:pending`, `call-transfer-context:{callId}`). Exposes `fillerPhrases` and `retryPhrases`. Subclasses implement `getGreeting()` and `onSpeech()`.
 - **`conversational-app.ts`** — `ConversationalApp extends BaseApp`. LLM-conversational pattern: goodbye detection, conversation history, Claude delegation, streaming with filler tagging. Configured via `AssistantConfig` (id, name, systemPrompt, greetings, fillers, goodbyes, retries, model, tools). `tools` is an optional string array of tool names — when set, only those tools are sent to Claude (per-app filtering).
 - **`survey-app.ts`** — `SurveyApp extends BaseApp`. Scripted Q&A: sequential questions, typed answer parsing, Claude-generated summary. Configured via `SurveyConfig` (id, name, greeting, closing, questions, retries).
 - **`registry.ts`** — `AppRegistry` singleton. Maps app IDs to instances (with `dynamic` flag for D1-loaded apps), resolves phone numbers to apps via `phoneRoutes` map. `register(app, opts?)` accepts `{ isDefault?, dynamic? }`. `getForNumber(phone)` checks `phoneRoutes` first, falls back to `defaultApp`. `setPhoneRoute(phone, appId)` / `removePhoneRoute(phone)` / `clearPhoneRoutes()` manage routing. `removeDynamic()` clears all D1-loaded entries, phone routes, and default for clean reload. `remove(appId)` removes a single entry.
@@ -237,7 +248,7 @@ Routes pattern-match on `TurnResult.type` to produce FreeClimb PerCL + TTS. The 
 
 ## Telephony (src/telephony/)
 
-- **`routes.ts`** — FreeClimb adapter. Converts engine `TurnResult` to PerCL + TTS. Handles `/call` and `/conversation` webhooks. If you swapped telephony providers, this directory gets replaced.
+- **`routes.ts`** — FreeClimb adapter. Converts engine `TurnResult` to PerCL + TTS. Handles `/call` and `/conversation` webhooks. `handleConversation` checks `call-app:{callId}` KV override before phone-route resolution for internal transfers. `applyGreetingTTS()` shared helper handles greeting audio for both initial calls and transfers. If you swapped telephony providers, this directory gets replaced.
 - **`percl.ts`** — PerCL command builder. `buildPerCL(response, baseUrl, ttsProvider)` converts `AppResponse` to FreeClimb JSON commands.
 
 ## Platform (src/platform/)
@@ -259,6 +270,8 @@ Creating a new app: `POST /apps/definitions` with type `conversational` or `surv
 
 ## Recent changes
 
+- **Warm transfer + River prompt hardening**: `transfer_to_app` tool now accepts optional `caller_intent` field. When present, writes `call-transfer-context:{callId}` to KV with the caller's request summary. Route handler forks on transfer: warm path (intent + ConversationalApp target) skips `onStart()`, injects intent as synthetic `SpeechInput`, falls through to `processTurn()` — target Claude responds directly without greeting. Cold path (no intent or SurveyApp target) delivers greeting as before. River's system prompt rewritten: voice-mode guard (no emojis/markdown), people-not-apps framing (Ava and Coco as colleagues), 3-strike intent escalation (suggest → insist → apologize+hangup), and warm transfer instructions (populate `caller_intent` for specific requests, leave empty for generic "let me talk to Ava"). Two-key KV design (durable override + one-shot pending flag) preserved from prior fix for eventual-consistency races.
+- **River intent router + internal call transfer**: River is a D1-defined ConversationalApp (`is_default: true`) that greets callers, classifies intent via Claude, and transfers to the right app using `transfer_to_app` tool. Transfer mechanism: `TransferTool` writes `call-app:{callId}` → app ID to KV; route handler detects pending flag on the next webhook, clears conversation history, delivers target app response. `ToolContext` interface added to `src/tools/types.ts` — threads `{ callId, env }` through `ToolRegistry.execute()` and both `streamClaude`/`callClaude` tool-use loops. Backward-compatible: existing tools ignore the extra param. `applyGreetingTTS()` helper extracted in `routes.ts` to share greeting TTS logic between initial calls and transfers. Direct phone lines: Ava (+15123083004) and Coco (+15122712496) bypass River via `phone_routes`. New file: `src/tools/transfer.ts`.
 - **Call Detail Records (CDR)**: D1-backed call logging with `call_records` and `call_turns` tables. Every call is recorded at start, every event (greeting, caller speech, assistant response, filler, no-input, goodbye) written as a turn with the actual text content. Streaming responses collected via `onStreamComplete` callback in `processRemainingStream` and written as a single joined `assistant_response` turn. All CDR writes are fire-and-forget — never block the call. Admin endpoints: `GET /cdr` (list with pagination/filters) and `GET /cdr/:callId` (full turn-by-turn detail). New `src/services/cdr-store.ts` data access module. `StreamOpts` extended with `onStreamComplete` callback.
 - **D1-driven app definitions + phone routing**: All app configs (conversational and survey) now live in D1 `app_definitions` table with a `type` discriminator and JSON `config` blob. `survey_definitions` table dropped. Worker startup loads active definitions from D1 and registers `ConversationalApp` or `SurveyApp` instances dynamically. New admin endpoints: `GET/POST /apps/definitions`, `GET/DELETE /apps/definitions/:id`, `POST /reload-apps`. Old `/surveys` and `/reload-surveys` endpoints removed. Per-app tool filtering via `ClaudeConfig.toolNames` — tools are code implementations, tool *assignment* is data. Phone number routing via `phone_routes` table: `GET/POST /phone-routes`, `DELETE /phone-routes/:phoneNumber`. Registry tracks `dynamic` flag and `phoneRoutes` map. D1 fallback: code-defined `AvaAssistant`/`RitaAssistant` registered if D1 unavailable. `src/services/app-store.ts` added for D1 data access. `survey-store.ts` slimmed to results-only (definition CRUD removed).
 - **Codebase reorganization**: Replaced monolithic `src/core/` with purpose-aligned directories: `src/engine/` (app framework + turn cycle), `src/services/` (Claude client, conversation, survey store), `src/telephony/` (FreeClimb routes + PerCL), `src/platform/` (auth, rate limiting, env). SurveyApp moved from `apps/survey.ts` to `engine/survey-app.ts`. `sanitizeForTTS` moved from percl to `tts/helpers.ts`. Old `src/core/` and `src/percl/` directories removed.
@@ -282,7 +295,12 @@ Downstream impact:
 - `ClaudeConfig` extended with `toolNames?: string[]`. `AssistantConfig` extended with `tools?: string[]`. Backward-compatible — undefined means all tools.
 - `/surveys`, `/surveys/:id`, `/reload-surveys` endpoints removed. Replaced by `/apps/definitions`, `/phone-routes`, `/reload-apps`.
 - `survey-store.ts` no longer exports definition CRUD functions. `app-store.ts` handles all definition and route data access.
-- No change to tool implementations, external contracts, or KV patterns. Keep `COGNOS_PUBLIC_KEY` and `COGNOS` Service Binding present in env.
+- `Tool.execute()` signature extended with optional `ToolContext` parameter. Existing tools unaffected. New tools needing call context (like `transfer_to_app`) receive `{ callId, env }` from the Claude client.
+- `call-app:{callId}` + `call-app:{callId}:pending` + `call-transfer-context:{callId}` KV keys used for internal transfers. `BaseApp.onEnd()` deletes all three alongside `conv:{callId}`. Route handler checks these before `registry.getForNumber()` — KV override takes precedence over phone routing.
+- `transfer_to_app` tool accepts optional `caller_intent` field. Warm transfer (intent present + ConversationalApp target) skips greeting and falls through to `processTurn()`. Cold transfer (no intent or SurveyApp) delivers greeting as before.
+- `routes.ts` exports `applyGreetingTTS()` helper (extracted from `handleIncomingCall`). Cold transfer and initial call handler both use it.
+- River is the default app (`is_default: true`). Ava is no longer default. Unrouted numbers reach River.
+- Keep `COGNOS_PUBLIC_KEY` and `COGNOS` Service Binding present in env.
 
 ## Environment
 

@@ -2,7 +2,7 @@
 // FreeClimb-specific adapter: converts engine TurnResults into PerCL + TTS.
 
 import { registry } from '../engine/registry.js';
-import type { Env, AppContext, SpeechInput } from '../engine/types.js';
+import type { Env, AppContext, AppResponse, SpeechInput, VoxnosApp } from '../engine/types.js';
 import { processTurn } from '../engine/engine.js';
 import type { TurnResult } from '../engine/engine.js';
 import { buildPerCL, sanitizeForTTS } from './percl.js';
@@ -19,6 +19,29 @@ function freeclimbAuth(env: Env): { auth: string; apiBase: string } {
     auth: btoa(`${env.FREECLIMB_ACCOUNT_ID}:${env.FREECLIMB_API_KEY}`),
     apiBase: 'https://www.freeclimb.com/apiserver',
   };
+}
+
+/** Pre-generate greeting audio for direct TTS modes and set audioUrls on the response. */
+async function applyGreetingTTS(response: AppResponse, origin: string, env: Env): Promise<void> {
+  if ((env.TTS_MODE === 'google' || env.TTS_MODE === '11labs') && response.speech?.text) {
+    const safeText = sanitizeForTTS(response.speech.text);
+    if (safeText) {
+      const gId = greetingCacheKey(safeText, voiceSlug(env));
+      try {
+        let audio = await env.RATE_LIMIT_KV.get(`tts:${gId}`, 'arrayBuffer');
+        if (audio) {
+          console.log(JSON.stringify({ event: 'greeting_cache_hit', key: gId, timestamp: new Date().toISOString() }));
+        } else {
+          audio = await callTTS(safeText, env);
+          await env.RATE_LIMIT_KV.put(`tts:${gId}`, audio, { expirationTtl: 6 * 60 * 60 });
+          console.log(JSON.stringify({ event: 'greeting_cache_miss', key: gId, timestamp: new Date().toISOString() }));
+        }
+        response.audioUrls = [`${origin}/tts-cache?id=${gId}`];
+      } catch (ttsErr) {
+        console.error(JSON.stringify({ event: 'greeting_tts_fail', error: String(ttsErr), timestamp: new Date().toISOString() }));
+      }
+    }
+  }
 }
 
 /**
@@ -67,32 +90,10 @@ export async function handleIncomingCall(request: Request, env: Env, ctx?: Execu
       );
     }
 
-    // For direct TTS modes (google, 11labs), pre-generate greeting audio and use Play instead of Say.
-    // Greetings are one of ~5 fixed strings; we cache them with a stable KV key and long TTL.
-    // If TTS generation fails, falls through to buildPerCL which uses FreeClimb Say as fallback.
-    if ((env.TTS_MODE === 'google' || env.TTS_MODE === '11labs') && response.speech?.text) {
-      const safeText = sanitizeForTTS(response.speech.text);
-      if (safeText) {
-        const origin = new URL(request.url).origin;
-        const greetingId = greetingCacheKey(safeText, voiceSlug(env));
-
-        try {
-          let audio = await env.RATE_LIMIT_KV.get(`tts:${greetingId}`, 'arrayBuffer');
-          if (audio) {
-            console.log(JSON.stringify({ event: 'greeting_cache_hit', key: greetingId, timestamp: new Date().toISOString() }));
-          } else {
-            audio = await callTTS(safeText, env);
-            // 6-hour TTL: covers voice/text updates while avoiding per-call TTS generation
-            await env.RATE_LIMIT_KV.put(`tts:${greetingId}`, audio, { expirationTtl: 6 * 60 * 60 });
-            console.log(JSON.stringify({ event: 'greeting_cache_miss', key: greetingId, timestamp: new Date().toISOString() }));
-          }
-          response.audioUrls = [`${origin}/tts-cache?id=${greetingId}`];
-        } catch (ttsErr) {
-          console.error(JSON.stringify({ event: 'greeting_tts_fail', error: String(ttsErr), timestamp: new Date().toISOString() }));
-          // response.audioUrls stays unset — buildPerCL will emit Say via FreeClimb built-in
-        }
-      }
-    }
+    // Pre-generate greeting audio for direct TTS modes (google, 11labs).
+    // Falls through to FreeClimb Say if TTS fails.
+    const origin = new URL(request.url).origin;
+    await applyGreetingTTS(response, origin, env);
 
     // Convert app response to FreeClimb PerCL
     const percl = await buildPerCL(response, request.url, getTTSProvider(env));
@@ -149,24 +150,81 @@ export async function handleConversation(
       // Still process normally — app.onEnd will fire via the engine
     }
 
-    // Route to app
-    const app = registry.getForNumber(body.to);
-
-    if (!app) {
-      return Response.json([{ Hangup: {} }]);
-    }
-
-    // Build context and input
+    // Build context early — needed by both transfer and normal paths
     const context: AppContext = {
       env,
       callId: body.callId,
       from: body.from,
       to: body.to,
     };
+    const origin = new URL(request.url).origin;
+
+    // --- Check for per-call app override (internal transfer from River, etc.) ---
+    // Three KV keys: durable app override, one-shot pending flag, optional warm-transfer context
+    const [callAppOverride, pendingFlag, transferContextRaw] = await Promise.all([
+      env.RATE_LIMIT_KV.get(`call-app:${body.callId}`),
+      env.RATE_LIMIT_KV.get(`call-app:${body.callId}:pending`),
+      env.RATE_LIMIT_KV.get(`call-transfer-context:${body.callId}`),
+    ]);
+
+    let warmTransferInput: string | undefined;
+    let transferredApp: VoxnosApp | undefined;
+
+    if (callAppOverride && pendingFlag) {
+      const targetApp = registry.get(callAppOverride);
+      if (targetApp) {
+        console.log(JSON.stringify({ event: 'call_transfer', callId: body.callId, to_app: callAppOverride, timestamp: new Date().toISOString() }));
+        // Clean up transfer keys
+        await Promise.all([
+          env.RATE_LIMIT_KV.delete(`call-app:${body.callId}:pending`),
+          env.RATE_LIMIT_KV.delete(`conv:${body.callId}`),
+          transferContextRaw ? env.RATE_LIMIT_KV.delete(`call-transfer-context:${body.callId}`) : Promise.resolve(),
+        ]);
+
+        // Parse warm-transfer context
+        let intent: string | undefined;
+        if (transferContextRaw) {
+          try { intent = (JSON.parse(transferContextRaw) as { intent?: string }).intent; } catch { /* ignore */ }
+        }
+
+        // Warm transfer: intent present + target supports streaming (ConversationalApp, not SurveyApp)
+        if (intent && targetApp.streamSpeech) {
+          console.log(JSON.stringify({ event: 'warm_transfer', callId: body.callId, to_app: callAppOverride, intent, timestamp: new Date().toISOString() }));
+          // CDR: transfer turn + synthetic caller_speech
+          if (db) {
+            ctx?.waitUntil(
+              addTurn(db, { callId: body.callId, turnType: 'transfer', speaker: 'system', content: `Transferred to ${targetApp.name}`, meta: { to_app: callAppOverride, warm: true, intent } })
+                .then(() => addTurn(db, { callId: body.callId, turnType: 'caller_speech', speaker: 'caller', content: intent!, meta: { warm_transfer: true } }))
+                .catch(() => {}),
+            );
+          }
+          // Fall through to normal processTurn with synthetic input
+          warmTransferInput = intent;
+          transferredApp = targetApp;
+        } else {
+          // Cold transfer — deliver target app's greeting
+          if (db) ctx?.waitUntil(addTurn(db, { callId: body.callId, turnType: 'transfer', speaker: 'system', content: `Transferred to ${targetApp.name}`, meta: { to_app: callAppOverride } }).catch(() => {}));
+          const greeting = await targetApp.onStart(context);
+          if (db) ctx?.waitUntil(addTurn(db, { callId: body.callId, turnType: 'greeting', speaker: 'system', content: greeting.speech?.text ?? '' }).catch(() => {}));
+          await applyGreetingTTS(greeting, origin, env);
+          const percl = await buildPerCL(greeting, request.url, getTTSProvider(env));
+          return Response.json(percl, { headers: { 'Content-Type': 'application/json' } });
+        }
+      }
+      // Target app not found — fall through to normal routing
+    }
+
+    // Route to app — warm transfer or KV override (post-transfer) takes precedence, then phone routes
+    const app = transferredApp
+      ?? (callAppOverride ? registry.get(callAppOverride) ?? registry.getForNumber(body.to) : registry.getForNumber(body.to));
+
+    if (!app) {
+      return Response.json([{ Hangup: {} }]);
+    }
 
     const input: SpeechInput = {
-      text: body.transcript ?? '',
-      confidence: undefined,  // FreeClimb doesn't provide confidence in TranscribeUtterance
+      text: warmTransferInput ?? body.transcript ?? '',
+      confidence: undefined,
     };
 
     // --- Engine: decide what happens this turn ---
@@ -175,8 +233,6 @@ export async function handleConversation(
       streaming,
       preFillerProbability: PRE_FILLER_PROBABILITY,
     });
-
-    const origin = new URL(request.url).origin;
 
     // --- FreeClimb adapter: convert TurnResult to PerCL ---
 

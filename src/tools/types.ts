@@ -1,5 +1,13 @@
 // Tool system for extending assistant capabilities
 
+import type { Env } from '../engine/types.js';
+
+/** Runtime context passed to tools during execution. */
+export interface ToolContext {
+  callId: string;
+  env: Env;
+}
+
 export interface ToolDefinition {
   name: string;
   description: string;
@@ -28,6 +36,6 @@ export interface Tool {
   // Tool metadata for Claude API
   definition: ToolDefinition;
 
-  // Execute the tool with given input
-  execute(input: Record<string, any>): Promise<string>;
+  // Execute the tool with given input. Context is optional for backward compat.
+  execute(input: Record<string, any>, context?: ToolContext): Promise<string>;
 }

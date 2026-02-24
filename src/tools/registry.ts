@@ -1,6 +1,6 @@
 // Tool registry for managing available tools
 
-import type { Tool, ToolDefinition } from './types.js';
+import type { Tool, ToolDefinition, ToolContext } from './types.js';
 import { validateToolInput } from './validation.js';
 
 class ToolRegistry {
@@ -33,7 +33,7 @@ class ToolRegistry {
     return defs;
   }
 
-  async execute(name: string, input: Record<string, any>): Promise<string> {
+  async execute(name: string, input: Record<string, any>, context?: ToolContext): Promise<string> {
     const tool = this.get(name);
     if (!tool) {
       throw new Error(`Tool not found: ${name}`);
@@ -53,7 +53,7 @@ class ToolRegistry {
 
     try {
       const result = await Promise.race([
-        tool.execute(validation.sanitizedInput!),
+        tool.execute(validation.sanitizedInput!, context),
         timeoutPromise
       ]);
       return result;

@@ -46,6 +46,9 @@ export abstract class BaseApp implements VoxnosApp {
 
   async onEnd(context: AppContext): Promise<void> {
     await context.env.RATE_LIMIT_KV.delete(`conv:${context.callId}`);
+    await context.env.RATE_LIMIT_KV.delete(`call-app:${context.callId}`);
+    await context.env.RATE_LIMIT_KV.delete(`call-app:${context.callId}:pending`);
+    await context.env.RATE_LIMIT_KV.delete(`call-transfer-context:${context.callId}`);
     console.log(JSON.stringify({
       event: 'call_end',
       callId: context.callId,

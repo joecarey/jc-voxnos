@@ -16,6 +16,7 @@ import { validateWebhook, createWebhookUnauthorizedResponse } from './platform/w
 import { toolRegistry } from './tools/registry.js';
 import { WeatherTool } from './tools/weather.js';
 import { CognosTool } from './tools/cognos.js';
+import { TransferTool } from './tools/transfer.js';
 import { checkRateLimit, getIPFromRequest, RATE_LIMITS } from './platform/rate-limit.js';
 import {
   handleIncomingCall,
@@ -47,6 +48,7 @@ async function setup(env: Env): Promise<void> {
   // Register tools
   toolRegistry.register(new WeatherTool());
   toolRegistry.register(new CognosTool(env.COGNOS_PUBLIC_KEY, env.COGNOS));
+  toolRegistry.register(new TransferTool());
 
   // Register code-defined apps (not config-driven)
   registry.register(new EchoApp());
