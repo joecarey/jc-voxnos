@@ -20,6 +20,8 @@ export interface AssistantConfig {
   model?: string;
   /** Tool names this app can use (resolved against ToolRegistry). When undefined, all tools are available. */
   tools?: string[];
+  /** Google TTS voice name (e.g. "en-US-Chirp3-HD-Leda"). When undefined, uses global default. */
+  voice?: string;
 }
 
 export class ConversationalApp extends BaseApp {
@@ -32,6 +34,7 @@ export class ConversationalApp extends BaseApp {
       name: config.name,
       fillerPhrases: config.fillers,
       retryPhrases: config.retries,
+      voice: config.voice,
     });
     this.config = config;
     this.claudeConfig = {

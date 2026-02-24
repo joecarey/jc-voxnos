@@ -9,6 +9,7 @@ export interface BaseAppConfig {
   name: string;
   fillerPhrases?: string[];
   retryPhrases?: string[];
+  voice?: string;
 }
 
 export abstract class BaseApp implements VoxnosApp {
@@ -16,12 +17,14 @@ export abstract class BaseApp implements VoxnosApp {
   readonly name: string;
   readonly fillerPhrases?: string[];
   readonly retryPhrases?: string[];
+  readonly voice?: string;
 
   constructor(config: BaseAppConfig) {
     this.id = config.id;
     this.name = config.name;
     this.fillerPhrases = config.fillerPhrases;
     this.retryPhrases = config.retryPhrases;
+    this.voice = config.voice;
   }
 
   /** Subclasses provide the greeting text. */

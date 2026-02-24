@@ -8,10 +8,12 @@ import { callElevenLabs, ELEVENLABS_VOICE_ID } from './elevenlabs.js';
 import { callGoogleTTS, GOOGLE_TTS_VOICE } from './google.js';
 
 /** Short voice identifier appended to all stable TTS cache keys.
- *  When the voice changes, URLs change and FreeClimb's HTTP cache is automatically busted. */
-export function voiceSlug(env: Env): string {
+ *  When the voice changes, URLs change and FreeClimb's HTTP cache is automatically busted.
+ *  Per-app voice override: pass the full Google voice name to derive the slug from it. */
+export function voiceSlug(env: Env, voice?: string): string {
   if (env.TTS_MODE === '11labs') return 'sarah';
-  return GOOGLE_TTS_VOICE.split('-').pop()!.toLowerCase(); // "despina"
+  const name = voice ?? GOOGLE_TTS_VOICE;
+  return name.split('-').pop()!.toLowerCase();
 }
 
 /** Derive a stable, URL-safe KV cache key for a greeting phrase. */
@@ -20,10 +22,11 @@ export function greetingCacheKey(text: string, slug: string): string {
   return `greeting-${key}-${slug}`;
 }
 
-/** Call the active TTS provider (Google or ElevenLabs) for a text string. */
-export function callTTS(text: string, env: Env): Promise<ArrayBuffer> {
+/** Call the active TTS provider (Google or ElevenLabs) for a text string.
+ *  Per-app voice override: pass the full Google voice name (e.g. "en-US-Chirp3-HD-Leda"). */
+export function callTTS(text: string, env: Env, voice?: string): Promise<ArrayBuffer> {
   if (env.TTS_MODE === 'google') {
-    return callGoogleTTS(text, env.GOOGLE_TTS_API_KEY!);
+    return callGoogleTTS(text, env.GOOGLE_TTS_API_KEY!, voice);
   }
   return callElevenLabs(text, env.ELEVENLABS_API_KEY!, undefined, env.ELEVENLABS_BASE_URL);
 }

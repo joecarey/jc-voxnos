@@ -25,6 +25,10 @@ export interface SurveyAnswer {
 interface SurveyState {
   currentQuestion: number;
   answers: SurveyAnswer[];
+  /** Consecutive parse failures on the current question (reset on success). */
+  retriesForQuestion: number;
+  /** Total parse failures across all questions in this call. */
+  totalErrors: number;
 }
 
 export interface SurveyConfig {
@@ -34,16 +38,24 @@ export interface SurveyConfig {
   closing: string;
   questions: SurveyQuestion[];
   retries?: string[];
+  voice?: string;
 }
 
 const SURVEY_STATE_TTL = 15 * 60; // 15 minutes — same as conversation history
 const SURVEY_RESULTS_TTL = 24 * 60 * 60; // 24 hours — completed results for later retrieval
 
+/** Max consecutive parse failures per question before bailing. */
+const MAX_RETRIES_PER_QUESTION = 3;
+/** Max total parse failures across all questions before bailing. */
+const MAX_TOTAL_ERRORS = 5;
+
+const BAIL_MESSAGE = "I'm sorry, we seem to be having some trouble. Thank you for your time. Goodbye.";
+
 export class SurveyApp extends BaseApp {
   private readonly surveyConfig: SurveyConfig;
 
   constructor(config: SurveyConfig) {
-    super({ id: config.id, name: config.name, retryPhrases: config.retries });
+    super({ id: config.id, name: config.name, retryPhrases: config.retries, voice: config.voice });
     this.surveyConfig = config;
   }
 
@@ -56,7 +68,7 @@ export class SurveyApp extends BaseApp {
     const response = await super.onStart(context);
 
     // Initialize state
-    const state: SurveyState = { currentQuestion: 0, answers: [] };
+    const state: SurveyState = { currentQuestion: 0, answers: [], retriesForQuestion: 0, totalErrors: 0 };
     await this.saveState(context, state);
 
     // Append first question to greeting
@@ -79,12 +91,21 @@ export class SurveyApp extends BaseApp {
     const parsed = this.parseAnswer(raw, currentQ.type);
 
     if (parsed === null) {
-      // Re-prompt — answer didn't match expected type
-      const reprompt = this.getReprompt(currentQ);
+      state.retriesForQuestion++;
+      state.totalErrors++;
+
+      // Bail: global error cap or per-question cap reached
+      if (state.totalErrors >= MAX_TOTAL_ERRORS || state.retriesForQuestion >= MAX_RETRIES_PER_QUESTION) {
+        return { speech: { text: BAIL_MESSAGE }, hangup: true };
+      }
+
+      await this.saveState(context, state);
+      const reprompt = this.getReprompt(currentQ, state.retriesForQuestion);
       return { speech: { text: reprompt }, prompt: true };
     }
 
-    // Record answer
+    // Record answer — reset per-question retry counter on success
+    state.retriesForQuestion = 0;
     state.answers.push({
       label: currentQ.label,
       question: currentQ.text,
@@ -148,14 +169,25 @@ export class SurveyApp extends BaseApp {
     }
   }
 
-  private getReprompt(question: SurveyQuestion): string {
+  private getReprompt(question: SurveyQuestion, tier: number): string {
+    if (tier === 1) {
+      switch (question.type) {
+        case 'yes_no':
+          return `I didn't quite catch that. Could you answer yes or no? ${question.text}`;
+        case 'scale':
+          return `I need a number from 1 to 5. ${question.text}`;
+        case 'open':
+          return `Could you say that again? ${question.text}`;
+      }
+    }
+    // Tier 2 — different phrasing, last chance before bail
     switch (question.type) {
       case 'yes_no':
-        return `I didn't quite catch that. Could you answer yes or no? ${question.text}`;
+        return `Let me try one more time. Just a simple yes or no. ${question.text}`;
       case 'scale':
-        return `I need a number from 1 to 5. ${question.text}`;
+        return `Once more, on a scale of 1 to 5, just the number. ${question.text}`;
       case 'open':
-        return `Could you say that again? ${question.text}`;
+        return `Sorry about that. One more try. ${question.text}`;
     }
   }
 

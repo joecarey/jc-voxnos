@@ -99,6 +99,7 @@ function registerAppFromDefinition(def: AppDefinitionRow): void {
       retries: c.retries as string[] | undefined,
       model: c.model as string | undefined,
       tools: c.tools as string[] | undefined,
+      voice: c.voice as string | undefined,
     };
     registry.register(new ConversationalApp(config), opts);
   } else if (def.type === 'survey') {
@@ -110,6 +111,7 @@ function registerAppFromDefinition(def: AppDefinitionRow): void {
       closing: c.closing as string,
       questions: c.questions as SurveyConfig['questions'],
       retries: c.retries as string[] | undefined,
+      voice: c.voice as string | undefined,
     };
     registry.register(new SurveyApp(config), opts);
   } else {
@@ -162,6 +164,7 @@ function validateConversationalConfig(c: Record<string, unknown>): string | null
     }
   }
   if (c.model !== undefined && typeof c.model !== 'string') return 'config.model must be a string';
+  if (c.voice !== undefined && c.voice !== null && typeof c.voice !== 'string') return 'config.voice must be a string';
   if (c.tools !== undefined && c.tools !== null) {
     if (!Array.isArray(c.tools) || !c.tools.every((t: unknown) => typeof t === 'string')) {
       return 'config.tools must be an array of strings';
@@ -188,6 +191,7 @@ function validateSurveyConfig(c: Record<string, unknown>): string | null {
       return 'config.retries must be an array of strings';
     }
   }
+  if (c.voice !== undefined && c.voice !== null && typeof c.voice !== 'string') return 'config.voice must be a string';
   return null;
 }
 

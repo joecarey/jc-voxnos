@@ -12,8 +12,8 @@ TTS_MODE = "google"
 
 [[d1_databases]]
 binding = "DB"
-database_name = "jc-voxnos-surveys"
-database_id = "131ed879-edf4-414c-83c7-c76fa5ede37c"
+database_name = "jc-voxnos"
+database_id = "0998cfff-5efd-4b08-9186-4a3d4f528e98"
 
 [[services]]
 binding = "COGNOS"

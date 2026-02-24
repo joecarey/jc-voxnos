@@ -21,18 +21,36 @@ function freeclimbAuth(env: Env): { auth: string; apiBase: string } {
   };
 }
 
-/** Pre-generate greeting audio for direct TTS modes and set audioUrls on the response. */
-async function applyGreetingTTS(response: AppResponse, origin: string, env: Env): Promise<void> {
+/** Pre-generate TTS audio for a non-streaming response (SurveyApp, fallback path, etc.).
+ *  Uses a UUID key with short TTL — responses vary per turn, no stable cache key. */
+async function applyResponseTTS(response: AppResponse, origin: string, env: Env, voice?: string): Promise<void> {
   if ((env.TTS_MODE === 'google' || env.TTS_MODE === '11labs') && response.speech?.text) {
     const safeText = sanitizeForTTS(response.speech.text);
     if (safeText) {
-      const gId = greetingCacheKey(safeText, voiceSlug(env));
+      try {
+        const audio = await callTTS(safeText, env, voice);
+        const id = crypto.randomUUID();
+        await env.RATE_LIMIT_KV.put(`tts:${id}`, audio, { expirationTtl: 120 });
+        response.audioUrls = [`${origin}/tts-cache?id=${id}`];
+      } catch (ttsErr) {
+        console.error(JSON.stringify({ event: 'response_tts_fail', error: String(ttsErr), timestamp: new Date().toISOString() }));
+      }
+    }
+  }
+}
+
+/** Pre-generate greeting audio for direct TTS modes and set audioUrls on the response. */
+async function applyGreetingTTS(response: AppResponse, origin: string, env: Env, voice?: string): Promise<void> {
+  if ((env.TTS_MODE === 'google' || env.TTS_MODE === '11labs') && response.speech?.text) {
+    const safeText = sanitizeForTTS(response.speech.text);
+    if (safeText) {
+      const gId = greetingCacheKey(safeText, voiceSlug(env, voice));
       try {
         let audio = await env.RATE_LIMIT_KV.get(`tts:${gId}`, 'arrayBuffer');
         if (audio) {
           console.log(JSON.stringify({ event: 'greeting_cache_hit', key: gId, timestamp: new Date().toISOString() }));
         } else {
-          audio = await callTTS(safeText, env);
+          audio = await callTTS(safeText, env, voice);
           await env.RATE_LIMIT_KV.put(`tts:${gId}`, audio, { expirationTtl: 6 * 60 * 60 });
           console.log(JSON.stringify({ event: 'greeting_cache_miss', key: gId, timestamp: new Date().toISOString() }));
         }
@@ -93,7 +111,7 @@ export async function handleIncomingCall(request: Request, env: Env, ctx?: Execu
     // Pre-generate greeting audio for direct TTS modes (google, 11labs).
     // Falls through to FreeClimb Say if TTS fails.
     const origin = new URL(request.url).origin;
-    await applyGreetingTTS(response, origin, env);
+    await applyGreetingTTS(response, origin, env, app.voice);
 
     // Convert app response to FreeClimb PerCL
     const percl = await buildPerCL(response, request.url, getTTSProvider(env));
@@ -206,7 +224,7 @@ export async function handleConversation(
           if (db) ctx?.waitUntil(addTurn(db, { callId: body.callId, turnType: 'transfer', speaker: 'system', content: `Transferred to ${targetApp.name}`, meta: { to_app: callAppOverride } }).catch(() => {}));
           const greeting = await targetApp.onStart(context);
           if (db) ctx?.waitUntil(addTurn(db, { callId: body.callId, turnType: 'greeting', speaker: 'system', content: greeting.speech?.text ?? '' }).catch(() => {}));
-          await applyGreetingTTS(greeting, origin, env);
+          await applyGreetingTTS(greeting, origin, env, targetApp.voice);
           const percl = await buildPerCL(greeting, request.url, getTTSProvider(env));
           return Response.json(percl, { headers: { 'Content-Type': 'application/json' } });
         }
@@ -240,7 +258,7 @@ export async function handleConversation(
       console.log(JSON.stringify({ event: 'no_input', callId: body.callId, transcribeReason: body.transcribeReason, timestamp: new Date().toISOString() }));
       // CDR: record no-input turn
       if (db) ctx?.waitUntil(addTurn(db, { callId: body.callId, turnType: 'no_input', speaker: 'system', content: result.retryPhrase, meta: { transcribeReason: body.transcribeReason } }).catch(() => {}));
-      return handleNoInputResponse(result.retryPhrase, origin, env);
+      return handleNoInputResponse(result.retryPhrase, origin, env, app.voice);
     }
 
     if (result.type === 'stream') {
@@ -268,9 +286,9 @@ export async function handleConversation(
         if (result.preFiller) {
           // CDR: record filler turn
           if (db) ctx!.waitUntil(addTurn(db, { callId: body.callId, turnType: 'filler', speaker: 'system', content: result.preFiller.phrase }).catch(() => {}));
-          return await handlePreFillerStream(result, context, turnId, callKey, origin, env, ctx!, onStreamComplete);
+          return await handlePreFillerStream(result, context, turnId, callKey, origin, env, ctx!, onStreamComplete, app.voice);
         }
-        return await handleStandardStream(result, context, turnId, callKey, origin, env, ctx!, onStreamComplete);
+        return await handleStandardStream(result, context, turnId, callKey, origin, env, ctx!, onStreamComplete, app.voice);
       } catch (streamErr) {
         console.error('Streaming path error, falling back to non-streaming:', streamErr);
         // Fall through to non-streaming below
@@ -278,6 +296,7 @@ export async function handleConversation(
 
       // Streaming failed — fall back to non-streaming via onSpeech
       const fallback = await app.onSpeech(context, input);
+      await applyResponseTTS(fallback, origin, env, app.voice);
       const percl = await buildPerCL(fallback, request.url, getTTSProvider(env));
       if (fallback.hangup && result.cleanup && ctx) ctx.waitUntil(result.cleanup());
       // CDR: record fallback response
@@ -292,6 +311,9 @@ export async function handleConversation(
     }
 
     // type === 'response' — non-streaming path
+    // Pre-generate TTS for direct modes (google, 11labs) so buildPerCL emits Play, not Say
+    await applyResponseTTS(result.speech, origin, env, app.voice);
+
     // CDR: record caller speech + response
     if (db) {
       const cdrWrites = async () => {
@@ -327,13 +349,14 @@ async function handleNoInputResponse(
   retryPhrase: string,
   origin: string,
   env: Env,
+  voice?: string,
 ): Promise<Response> {
   // Use a stable cache key based on the phrase content for consistent TTS caching
   const phraseKey = retryPhrase.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
-  const retryCacheKey = `retry-${phraseKey}-${voiceSlug(env)}`;
+  const retryCacheKey = `retry-${phraseKey}-${voiceSlug(env, voice)}`;
   let retryAudio = await env.RATE_LIMIT_KV.get(`tts:${retryCacheKey}`, 'arrayBuffer');
   if (!retryAudio) {
-    retryAudio = await callTTS(retryPhrase, env);
+    retryAudio = await callTTS(retryPhrase, env, voice);
     await env.RATE_LIMIT_KV.put(`tts:${retryCacheKey}`, retryAudio, { expirationTtl: 6 * 60 * 60 });
   }
   return Response.json([
@@ -358,20 +381,21 @@ async function handlePreFillerStream(
   env: Env,
   ctx: ExecutionContext,
   onStreamComplete?: (sentences: string[], hangup: boolean) => Promise<void>,
+  voice?: string,
 ): Promise<Response> {
   const { preFiller, stream, skipFillers, cleanup } = result;
   console.log(JSON.stringify({ event: 'pre_filler', callId: context.callId, turnId, timestamp: new Date().toISOString() }));
-  const fillerId = `filler-${preFiller!.fillerIndex}-${voiceSlug(env)}`;
+  const fillerId = `filler-${preFiller!.fillerIndex}-${voiceSlug(env, voice)}`;
 
   // Cache-first: filler audio is reused across calls
   let fillerAudio = await env.RATE_LIMIT_KV.get(`tts:${fillerId}`, 'arrayBuffer');
   if (!fillerAudio) {
-    fillerAudio = await callTTS(preFiller!.phrase, env);
+    fillerAudio = await callTTS(preFiller!.phrase, env, voice);
     await env.RATE_LIMIT_KV.put(`tts:${fillerId}`, fillerAudio, { expirationTtl: 6 * 60 * 60 });
   }
 
   // Start the full stream in background — skipFillers prevents double-filler
-  ctx.waitUntil(processRemainingStream(stream, callKey, env, 0, { skipFillers, onHangup: cleanup, onStreamComplete }));
+  ctx.waitUntil(processRemainingStream(stream, callKey, env, 0, { skipFillers, onHangup: cleanup, onStreamComplete, voice }));
 
   return Response.json(
     [
@@ -392,6 +416,7 @@ async function handleStandardStream(
   env: Env,
   ctx: ExecutionContext,
   onStreamComplete?: (sentences: string[], hangup: boolean) => Promise<void>,
+  voice?: string,
 ): Promise<Response> {
   const { stream, cleanup } = result;
   const firstResult = await stream.next();
@@ -406,17 +431,17 @@ async function handleStandardStream(
       let s1Audio: ArrayBuffer;
       let s1Id: string;
       if (chunk1.cacheKey) {
-        s1Id = `${chunk1.cacheKey}-${voiceSlug(env)}`;
+        s1Id = `${chunk1.cacheKey}-${voiceSlug(env, voice)}`;
         const cached = await env.RATE_LIMIT_KV.get(`tts:${s1Id}`, 'arrayBuffer');
         if (cached) {
           s1Audio = cached;
         } else {
-          s1Audio = await callTTS(safeSentence1, env);
+          s1Audio = await callTTS(safeSentence1, env, voice);
           await env.RATE_LIMIT_KV.put(`tts:${s1Id}`, s1Audio, { expirationTtl: 6 * 60 * 60 });
         }
       } else {
         s1Id = crypto.randomUUID();
-        s1Audio = await callTTS(safeSentence1, env);
+        s1Audio = await callTTS(safeSentence1, env, voice);
         await env.RATE_LIMIT_KV.put(`tts:${s1Id}`, s1Audio, { expirationTtl: 120 });
       }
 
@@ -437,7 +462,7 @@ async function handleStandardStream(
         ? async (sentences: string[], hangup: boolean) => onStreamComplete([safeSentence1, ...sentences], hangup)
         : undefined;
       await env.RATE_LIMIT_KV.put(`${callKey}:1`, s1Id, { expirationTtl: 120 });
-      ctx.waitUntil(processRemainingStream(stream, callKey, env, 1, { onHangup: cleanup, onStreamComplete: wrappedOnComplete }));
+      ctx.waitUntil(processRemainingStream(stream, callKey, env, 1, { onHangup: cleanup, onStreamComplete: wrappedOnComplete, voice }));
 
       return Response.json(
         [

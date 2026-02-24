@@ -16,6 +16,8 @@ export interface StreamOpts {
   /** Called after the stream finishes with all sentence texts and whether the call ended.
    *  Used by CDR to record the full assistant response. */
   onStreamComplete?: (sentences: string[], hangup: boolean) => Promise<void>;
+  /** Per-app Google TTS voice name (e.g. "en-US-Chirp3-HD-Leda"). */
+  voice?: string;
 }
 
 export async function processRemainingStream(
@@ -40,7 +42,7 @@ export async function processRemainingStream(
       const safeSentence = sanitizeForTTS(chunk.text);
       if (!safeSentence) continue;
       collectedSentences.push(safeSentence);
-      const audio = await callTTS(safeSentence, env);
+      const audio = await callTTS(safeSentence, env, opts?.voice);
       const id = crypto.randomUUID();
       await env.RATE_LIMIT_KV.put(`tts:${id}`, audio, { expirationTtl: 120 });
       await env.RATE_LIMIT_KV.put(`${callKey}:${n}`, id, { expirationTtl: 120 });

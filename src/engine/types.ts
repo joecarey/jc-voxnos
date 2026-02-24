@@ -63,6 +63,9 @@ export interface VoxnosApp {
   // Engine picks one at random. Falls back to default retry phrases if not set.
   retryPhrases?: string[];
 
+  // Google TTS voice name (e.g. "en-US-Chirp3-HD-Leda"). When undefined, uses global default.
+  voice?: string;
+
   // Handle start of new call
   onStart(context: AppContext): Promise<AppResponse>;
 
