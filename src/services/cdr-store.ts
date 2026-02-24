@@ -158,55 +158,30 @@ export async function listCallRecords(db: D1Database, opts: ListCallOpts = {}): 
 
 // --- Call turns ---
 
-/** Add a single turn. Seq is auto-assigned as next in sequence for the call. */
+/** Add a single turn. Seq is auto-assigned as next in sequence for the call.
+ *  Retries once on UNIQUE constraint violation (concurrent fire-and-forget writes). */
 export async function addTurn(db: D1Database, input: TurnInput): Promise<boolean> {
+  const sql = `INSERT INTO call_turns (call_id, seq, turn_type, speaker, content, meta)
+         VALUES (?, COALESCE((SELECT MAX(seq) FROM call_turns WHERE call_id = ?), -1) + 1, ?, ?, ?, ?)`;
+  const params = [
+    input.callId, input.callId, input.turnType, input.speaker,
+    input.content ?? null, input.meta ? JSON.stringify(input.meta) : null,
+  ];
   try {
-    await db
-      .prepare(
-        `INSERT INTO call_turns (call_id, seq, turn_type, speaker, content, meta)
-         VALUES (?, COALESCE((SELECT MAX(seq) FROM call_turns WHERE call_id = ?), -1) + 1, ?, ?, ?, ?)`,
-      )
-      .bind(
-        input.callId,
-        input.callId,
-        input.turnType,
-        input.speaker,
-        input.content ?? null,
-        input.meta ? JSON.stringify(input.meta) : null,
-      )
-      .run();
+    await db.prepare(sql).bind(...params).run();
     return true;
   } catch (err) {
+    // Retry once on UNIQUE constraint violation (concurrent seq assignment)
+    if (String(err).includes('UNIQUE constraint')) {
+      try {
+        await db.prepare(sql).bind(...params).run();
+        return true;
+      } catch (retryErr) {
+        console.error('CDR addTurn retry failed:', retryErr);
+        return false;
+      }
+    }
     console.error('CDR addTurn failed:', err);
-    return false;
-  }
-}
-
-/** Batch-insert multiple turns. Seqs are auto-assigned sequentially. */
-export async function addTurnsBatch(db: D1Database, turns: TurnInput[]): Promise<boolean> {
-  if (turns.length === 0) return true;
-  try {
-    // Get current max seq for the call
-    const callId = turns[0].callId;
-    const maxRow = await db
-      .prepare('SELECT COALESCE(MAX(seq), -1) AS max_seq FROM call_turns WHERE call_id = ?')
-      .bind(callId)
-      .first();
-    let nextSeq = ((maxRow as Record<string, unknown>)?.max_seq as number ?? -1) + 1;
-
-    const stmts = turns.map((t) => {
-      const seq = nextSeq++;
-      return db
-        .prepare(
-          `INSERT INTO call_turns (call_id, seq, turn_type, speaker, content, meta) VALUES (?, ?, ?, ?, ?, ?)`,
-        )
-        .bind(t.callId, seq, t.turnType, t.speaker, t.content ?? null, t.meta ? JSON.stringify(t.meta) : null);
-    });
-
-    await db.batch(stmts);
-    return true;
-  } catch (err) {
-    console.error('CDR addTurnsBatch failed:', err);
     return false;
   }
 }

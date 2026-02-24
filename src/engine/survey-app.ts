@@ -157,9 +157,15 @@ export class SurveyApp extends BaseApp {
       case 'scale': {
         const match = lower.match(/\b([1-5])\b/);
         if (match) return parseInt(match[1], 10);
-        // Try word forms
-        const words: Record<string, number> = { one: 1, two: 2, three: 3, four: 4, five: 5 };
-        for (const [word, num] of Object.entries(words)) {
+        // Word forms + common ASR mistranscriptions (e.g. "five" → "bye", "four" → "for")
+        const scaleMap: Record<string, number> = {
+          one: 1, won: 1,
+          two: 2, to: 2, too: 2, do: 2,
+          three: 3, free: 3, tree: 3,
+          four: 4, for: 4, fore: 4, or: 4, door: 4,
+          five: 5, bye: 5, hive: 5, jive: 5, hi: 5,
+        };
+        for (const [word, num] of Object.entries(scaleMap)) {
           if (lower.includes(word)) return num;
         }
         return null; // unclear — re-prompt
@@ -194,7 +200,7 @@ export class SurveyApp extends BaseApp {
   private getAcknowledgment(type: SurveyQuestion['type'], parsed: string | number | boolean): string {
     switch (type) {
       case 'yes_no':
-        return parsed ? 'Got it, yes.' : 'Got it, no.';
+        return 'Got it.';
       case 'scale':
         return `${parsed} out of 5, got it.`;
       case 'open':

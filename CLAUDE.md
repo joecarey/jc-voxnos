@@ -7,12 +7,13 @@ Multi-app voice platform: FreeClimb telephony + Claude Sonnet 4.6 + Google Chirp
 **Call flow**: `/call` → App Router → `app.onStart()` greeting. `/conversation` → Engine `processTurn()` → TurnResult → FreeClimb adapter → PerCL + TTS.
 
 **Source layout**:
-- `src/index.ts` — entry point, HTTP router, admin endpoints
+- `src/index.ts` — entry point, env validation, isolate setup, HTTP routing table
+- `src/admin/` — admin endpoint handlers (routes, validation, helpers)
 - `src/engine/` — conversation engine + app framework (types, engine, base-app, conversational-app, survey-app, registry, speech-utils)
-- `src/telephony/` — FreeClimb adapter (routes, percl)
+- `src/telephony/` — FreeClimb adapter (routes, percl, freeclimb-admin)
 - `src/services/` — shared clients (claude-client, conversation, survey-store, app-store, cdr-store)
 - `src/platform/` — HTTP infrastructure (auth, webhook-auth, rate-limit, env)
-- `src/apps/` — concrete app instances (ava, rita, otto, echo)
+- `src/apps/` — concrete app instances (ava, rita, echo)
 - `src/tts/` — TTS providers (google, elevenlabs, freeclimb, helpers, streaming)
 - `src/tools/` — tool system (registry, weather, cognos, transfer)
 
@@ -32,14 +33,13 @@ VoxnosApp (interface — platform contract)
 
 ### Static (code-defined)
 - `EchoApp` — demo only, implements VoxnosApp directly
-- `OttoAssistant` — dormant snapshot of pre-Ava assistant (2026-02-23); not routed to any FreeClimb number
 
 ### Dynamic (D1-driven — `app_definitions` table)
 Loaded from `app_definitions` table at Worker startup. Each active row becomes a `ConversationalApp` or `SurveyApp` instance registered with `{ dynamic: true }`. Managed via `POST /apps/definitions`, `DELETE /apps/definitions/:id`, `POST /reload-apps`.
-- `river` — **default** — ConversationalApp, intent router, voice: Leda. Greets callers, classifies intent via Claude, transfers to the right app using `transfer_to_app` tool. No other tools — never answers questions directly.
-- `ava` — ConversationalApp, Claude Sonnet 4.6, tools (weather + cognos), voice: Despina, streaming TTS. Warm/familiar personality, informal greetings, short fillers.
+- `river` — **default** — ConversationalApp, intent router, voice: Despina. Greets callers, classifies intent via Claude, transfers to the right app using `transfer_to_app` tool. No other tools — never answers questions directly.
+- `ava` — ConversationalApp, Claude Sonnet 4.6, tools (weather + cognos), voice: Aoede, streaming TTS. Warm/familiar personality, informal greetings, short fillers.
 - `rita` — ConversationalApp, neutral/professional personality, tools (weather + cognos).
-- `coco` — SurveyApp, 3-question CX demo (satisfaction/scale, recommend/yes_no, feedback/open), voice: Aoede
+- `coco` — SurveyApp, 3-question CX demo (satisfaction/scale, recommend/yes_no, feedback/open), voice: Leda
 
 **Fallback**: if D1 is unavailable at startup, code-defined `AvaAssistant` and `RitaAssistant` (`src/apps/ava.ts`, `src/apps/rita.ts`) are registered instead.
 
@@ -87,7 +87,7 @@ Apps can transfer a call to another app mid-session using the `transfer_to_app` 
 
 **Active**: `TTS_MODE=google` → Google Chirp 3 HD, LINEAR16 WAV 8kHz
 **Default voice**: `en-US-Chirp3-HD-Despina` (used when app has no `config.voice`)
-**Per-app voices**: each app definition can set `config.voice` to a full Google voice name (e.g. `en-US-Chirp3-HD-Leda`). Threaded through `callTTS(text, env, voice)`, `voiceSlug(env, voice)`, `applyGreetingTTS(..., voice)`, and `processRemainingStream` via `StreamOpts.voice`. Current assignments: Ava=Despina, River=Leda, Coco=Aoede, Rita=default.
+**Per-app voices**: each app definition can set `config.voice` to a full Google voice name (e.g. `en-US-Chirp3-HD-Leda`). Threaded through `callTTS(text, env, voice)`, `voiceSlug(env, voice)`, `applyTTS(..., strategy, voice)`, and `processRemainingStream` via `StreamOpts.voice`. Current assignments: Ava=Aoede, River=Despina, Coco=Leda, Rita=default.
 **Modes**: `google` (active) | `11labs` (direct ElevenLabs) | `freeclimb` (built-in, always fallback)
 **Fallback**: google/11labs failure → FreeClimb built-in Say automatically
 **Cache key rule**: stable keys append `voiceSlug(env, voice)` (derives slug from per-app voice or global default); `/tts-cache` always `Cache-Control: no-store`
@@ -246,12 +246,19 @@ Routes pattern-match on `TurnResult.type` to produce FreeClimb PerCL + TTS. The 
 - **`conversation.ts`** — `ContentBlock`/`Message` types, `compressToolResults()`, `getMessages()`, `saveMessages()`. KV conversation history with 15-min TTL.
 - **`survey-store.ts`** — D1 data access for survey results only. `saveSurveyResult(db, result)`, `listSurveyResults(db, opts)`, `getSurveyResult(db, id)`. Used by SurveyApp (write) and admin endpoints (read).
 - **`app-store.ts`** — D1 data access for `app_definitions` and `phone_routes` tables. App definitions: `loadAllActiveApps`, `loadAppDefinition`, `saveAppDefinition`, `deleteAppDefinition` (soft-delete), `listAppDefinitions`. Phone routes: `loadPhoneRoutes`, `savePhoneRoute`, `deletePhoneRoute`. Pure data access, no app dependencies.
-- **`cdr-store.ts`** — D1 data access for `call_records` and `call_turns` (CDR). Writes: `createCallRecord`, `endCallRecord`, `updateCallTokens`, `addTurn`, `addTurnsBatch`. Reads: `getCallRecord`, `getCallTurns`, `listCallRecords` (paginated with filters). Seq auto-assigned via `MAX(seq)+1`. All write functions designed for fire-and-forget.
+- **`cdr-store.ts`** — D1 data access for `call_records` and `call_turns` (CDR). Writes: `createCallRecord`, `endCallRecord`, `updateCallTokens`, `addTurn`. Reads: `getCallRecord`, `getCallTurns`, `listCallRecords` (paginated with filters). Seq auto-assigned via `MAX(seq)+1` with single-retry on UNIQUE constraint violation. All write functions designed for fire-and-forget.
 
 ## Telephony (src/telephony/)
 
-- **`routes.ts`** — FreeClimb adapter. Converts engine `TurnResult` to PerCL + TTS. Handles `/call` and `/conversation` webhooks. `handleConversation` checks `call-app:{callId}` KV override before phone-route resolution for internal transfers. `applyGreetingTTS()` handles greeting audio (stable cache keys, long TTL). `applyResponseTTS()` handles non-streaming responses (UUID keys, short TTL) — used by SurveyApp and streaming fallback paths to avoid voice drop to FreeClimb Say. If you swapped telephony providers, this directory gets replaced.
+- **`routes.ts`** — FreeClimb adapter. Converts engine `TurnResult` to PerCL + TTS. Handles `/call` and `/conversation` webhooks. `handleConversation` checks `call-app:{callId}` KV override before phone-route resolution for internal transfers. `applyTTS(response, origin, env, strategy, voice?)` handles both greeting TTS (stable cache keys, 6hr TTL) and response TTS (UUID keys, 120s TTL) via a `'greeting' | 'response'` strategy parameter. CDR writes log errors via `console.error` (never silently swallowed). If you swapped telephony providers, this directory gets replaced.
+- **`freeclimb-admin.ts`** — FreeClimb API admin wrappers: `handleHealthCheck`, `handleListApps`, `handleDebugAccount`, `handleListPhoneNumbers`, `handleSetup`, `handleUpdatePhoneNumber`, `handleGetLogs`, `handleUpdateApplication`. Separated from call-processing routes.
 - **`percl.ts`** — PerCL command builder. `buildPerCL(response, baseUrl, ttsProvider)` converts `AppResponse` to FreeClimb JSON commands.
+
+## Admin (src/admin/)
+
+- **`routes.ts`** — Admin endpoint handlers: app definitions CRUD, phone routes CRUD, survey results, CDR, costs, reload. Also exports `registerAppFromDefinition(def)` — instantiates a `ConversationalApp` or `SurveyApp` from a D1 definition row and registers it.
+- **`validation.ts`** — Input validation for app definitions (`validateAppInput`) and phone routes (`validatePhoneRouteInput`). Validates config shape per app type, checks tool names against `ToolRegistry`.
+- **`helpers.ts`** — `requireAdmin(request, env)` (auth + rate limiting gate), `requireD1(env)` (D1 availability check). Both return a `Response` on failure, `null` on success.
 
 ## Platform (src/platform/)
 
@@ -272,6 +279,8 @@ Creating a new app: `POST /apps/definitions` with type `conversational` or `surv
 
 ## Recent changes
 
+- **Codebase refactoring — file splits, dead code removal, CDR hardening**: Deleted `src/apps/otto.ts` (524-line dormant snapshot). Removed dead `addTurnsBatch` from `cdr-store.ts`. Added UNIQUE constraint retry in `addTurn` for concurrent seq assignment. Replaced 15 silent `.catch(() => {})` CDR writes in `routes.ts` with `console.error` logging. Extracted FreeClimb admin wrappers from `routes.ts` into `src/telephony/freeclimb-admin.ts` (8 handlers). Consolidated `applyGreetingTTS` + `applyResponseTTS` into single `applyTTS(response, origin, env, strategy, voice?)` with `'greeting' | 'response'` discriminator. Split `index.ts` (647→271 lines) into `src/admin/` directory: `validation.ts` (input validation), `helpers.ts` (auth + D1 gates), `routes.ts` (all admin endpoint handlers + `registerAppFromDefinition`). `routes.ts` reduced from 887 to ~470 lines (call webhooks only).
+- **SurveyApp scale parser: ASR mistranscription tolerance**: FreeClimb ASR frequently mistranscribes single-word numeric responses (e.g. "five"→"bye", "four"→"for"/"or"). `parseAnswer` scale branch now includes a `scaleMap` of common ASR near-misses alongside standard word forms (`bye`→5, `for`/`or`→4, `free`/`tree`→3, `to`/`too`/`do`→2, `won`→1). Voice assignments rotated: Ava=Aoede, River=Despina, Coco=Leda (D1 `app_definitions` updated, no code change).
 - **SurveyApp TTS fix + three-tier error escalation**: Non-streaming responses (SurveyApp, streaming fallback) now pre-generate Google TTS audio via `applyResponseTTS` before `buildPerCL`, preventing voice drop to FreeClimb's built-in Say. Three-tier error escalation in `SurveyApp.onSpeech`: tier 1 gentle re-ask, tier 2 rephrased last-chance prompt, tier 3 graceful bail with apology + hangup. Global error cap: 5 total parse failures across all questions triggers immediate bail. `SurveyState` extended with `retriesForQuestion` and `totalErrors` counters; per-question counter resets on successful parse.
 - **D1 database rename**: Renamed `jc-voxnos-surveys` → `jc-voxnos` to reflect the database's broader scope (app definitions, phone routes, CDR, and survey results — not just surveys). Schema and data migrated to new database, old one deleted. `wrangler.toml` binding updated.
 - **Per-app TTS voices + River prompt polish**: Each app can now set `config.voice` in its D1 definition (full Google voice name, e.g. `en-US-Chirp3-HD-Leda`). Voice threads from `VoxnosApp.voice` through `callTTS`, `voiceSlug`, `applyGreetingTTS`, and `processRemainingStream` via `StreamOpts.voice`. Cache keys include the per-app voice slug, preventing cross-app cache collisions. Apps without a voice field use the global default (Despina). Current assignments: Ava=Despina, River=Leda, Coco=Aoede. River's system prompt updated to avoid call-medium references ("have a great call" → "have a good day").
@@ -285,7 +294,6 @@ Creating a new app: `POST /apps/definitions` with type `conversational` or `surv
 - **Phase 2 app configuration model**: Introduced `BaseApp` → `ConversationalApp` → `SurveyApp` class hierarchy. Ava refactored to ~30-line config declaration. Added Rita (neutral assistant) and Coco (3-question CX survey).
 - **Phase 1 shared services extraction**: Extracted Claude API client, conversation history management, and speech utilities into shared modules.
 - **Ava rebrand**: `ClaudeAssistant` → `AvaAssistant` (`src/apps/ava.ts`). Named system prompt ("You are Ava"), informal greetings (random, no time-of-day), short fillers, warm goodbyes.
-- **Otto snapshot**: `OttoAssistant` (`src/apps/otto.ts`) — frozen copy of pre-Ava assistant with original personality. Dormant (no FreeClimb number).
 - **Pre-filler acknowledgments**: route layer plays a cached filler immediately on 50% of non-goodbye turns (`PRE_FILLER_PROBABILITY`). Fills dead air during Anthropic API TTFB. `VoxnosApp.fillerPhrases` lets each app declare its own set.
 - **Hangup-via-KV marker**: `processRemainingStream` writes `{callKey}:hangup` when it encounters a hangup chunk. `/continue` checks this and returns Play+Pause+Hangup. Covers edge cases where goodbye detection at the route layer has a false negative.
 - **Cognos Service Binding**: `env.COGNOS` Fetcher replaces public workers.dev URL — eliminates same-account edge routing 404s.
@@ -303,9 +311,13 @@ Downstream impact:
 - `Tool.execute()` signature extended with optional `ToolContext` parameter. Existing tools unaffected. New tools needing call context (like `transfer_to_app`) receive `{ callId, env }` from the Claude client.
 - `call-app:{callId}` + `call-app:{callId}:pending` + `call-transfer-context:{callId}` KV keys used for internal transfers. `BaseApp.onEnd()` deletes all three alongside `conv:{callId}`. Route handler checks these before `registry.getForNumber()` — KV override takes precedence over phone routing.
 - `transfer_to_app` tool accepts optional `caller_intent` field. Warm transfer (intent present + ConversationalApp target) skips greeting and falls through to `processTurn()`. Cold transfer (no intent or SurveyApp) delivers greeting as before.
-- `routes.ts` exports `applyGreetingTTS()` helper (extracted from `handleIncomingCall`). Cold transfer and initial call handler both use it.
+- `routes.ts` exports `applyTTS()` (consolidated from `applyGreetingTTS` + `applyResponseTTS`). Cold transfer and initial call handler both use it with `strategy: 'greeting'`.
 - River is the default app (`is_default: true`). Ava is no longer default. Unrouted numbers reach River.
 - `VoxnosApp.voice?: string` added to interface. `BaseAppConfig`, `AssistantConfig`, `SurveyConfig` all accept optional `voice`. `callTTS(text, env, voice?)` and `voiceSlug(env, voice?)` accept per-app voice override. `applyGreetingTTS` accepts voice. `StreamOpts.voice` passes voice into `processRemainingStream`. Backward-compatible — undefined means global default.
+- `src/admin/` contains `routes.ts`, `validation.ts`, `helpers.ts`. Admin endpoint handler bodies moved out of `index.ts`. `registerAppFromDefinition` now lives in `admin/routes.ts` (imported by `index.ts` for setup).
+- `src/telephony/freeclimb-admin.ts` contains FreeClimb API admin wrappers moved from `routes.ts`. `index.ts` imports from both `telephony/routes.js` and `telephony/freeclimb-admin.js`.
+- `src/apps/otto.ts` deleted. OttoAssistant removed from static apps.
+- CDR writes in `routes.ts` now log errors via `console.error('CDR write failed:', err)` instead of silently swallowing.
 - Keep `COGNOS_PUBLIC_KEY` and `COGNOS` Service Binding present in env.
 
 ## Environment

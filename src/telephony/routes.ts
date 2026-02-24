@@ -14,51 +14,37 @@ import { createCallRecord, addTurn, endCallRecord } from '../services/cdr-store.
 // 0.5 = coin flip. Set to 0 to disable, 1 to always play.
 const PRE_FILLER_PROBABILITY = 0.5;
 
-function freeclimbAuth(env: Env): { auth: string; apiBase: string } {
-  return {
-    auth: btoa(`${env.FREECLIMB_ACCOUNT_ID}:${env.FREECLIMB_API_KEY}`),
-    apiBase: 'https://www.freeclimb.com/apiserver',
-  };
-}
+/** Pre-generate TTS audio and set audioUrls on the response.
+ *  'greeting' strategy: stable cache key derived from text content, 6hr TTL, cache-first.
+ *  'response' strategy: UUID key, 120s TTL, no cache lookup (per-turn content varies). */
+async function applyTTS(
+  response: AppResponse, origin: string, env: Env,
+  strategy: 'greeting' | 'response', voice?: string,
+): Promise<void> {
+  if ((env.TTS_MODE !== 'google' && env.TTS_MODE !== '11labs') || !response.speech?.text) return;
+  const safeText = sanitizeForTTS(response.speech.text);
+  if (!safeText) return;
 
-/** Pre-generate TTS audio for a non-streaming response (SurveyApp, fallback path, etc.).
- *  Uses a UUID key with short TTL — responses vary per turn, no stable cache key. */
-async function applyResponseTTS(response: AppResponse, origin: string, env: Env, voice?: string): Promise<void> {
-  if ((env.TTS_MODE === 'google' || env.TTS_MODE === '11labs') && response.speech?.text) {
-    const safeText = sanitizeForTTS(response.speech.text);
-    if (safeText) {
-      try {
-        const audio = await callTTS(safeText, env, voice);
-        const id = crypto.randomUUID();
-        await env.RATE_LIMIT_KV.put(`tts:${id}`, audio, { expirationTtl: 120 });
-        response.audioUrls = [`${origin}/tts-cache?id=${id}`];
-      } catch (ttsErr) {
-        console.error(JSON.stringify({ event: 'response_tts_fail', error: String(ttsErr), timestamp: new Date().toISOString() }));
-      }
-    }
-  }
-}
-
-/** Pre-generate greeting audio for direct TTS modes and set audioUrls on the response. */
-async function applyGreetingTTS(response: AppResponse, origin: string, env: Env, voice?: string): Promise<void> {
-  if ((env.TTS_MODE === 'google' || env.TTS_MODE === '11labs') && response.speech?.text) {
-    const safeText = sanitizeForTTS(response.speech.text);
-    if (safeText) {
+  try {
+    if (strategy === 'greeting') {
       const gId = greetingCacheKey(safeText, voiceSlug(env, voice));
-      try {
-        let audio = await env.RATE_LIMIT_KV.get(`tts:${gId}`, 'arrayBuffer');
-        if (audio) {
-          console.log(JSON.stringify({ event: 'greeting_cache_hit', key: gId, timestamp: new Date().toISOString() }));
-        } else {
-          audio = await callTTS(safeText, env, voice);
-          await env.RATE_LIMIT_KV.put(`tts:${gId}`, audio, { expirationTtl: 6 * 60 * 60 });
-          console.log(JSON.stringify({ event: 'greeting_cache_miss', key: gId, timestamp: new Date().toISOString() }));
-        }
-        response.audioUrls = [`${origin}/tts-cache?id=${gId}`];
-      } catch (ttsErr) {
-        console.error(JSON.stringify({ event: 'greeting_tts_fail', error: String(ttsErr), timestamp: new Date().toISOString() }));
+      let audio = await env.RATE_LIMIT_KV.get(`tts:${gId}`, 'arrayBuffer');
+      if (audio) {
+        console.log(JSON.stringify({ event: 'greeting_cache_hit', key: gId, timestamp: new Date().toISOString() }));
+      } else {
+        audio = await callTTS(safeText, env, voice);
+        await env.RATE_LIMIT_KV.put(`tts:${gId}`, audio, { expirationTtl: 6 * 60 * 60 });
+        console.log(JSON.stringify({ event: 'greeting_cache_miss', key: gId, timestamp: new Date().toISOString() }));
       }
+      response.audioUrls = [`${origin}/tts-cache?id=${gId}`];
+    } else {
+      const audio = await callTTS(safeText, env, voice);
+      const id = crypto.randomUUID();
+      await env.RATE_LIMIT_KV.put(`tts:${id}`, audio, { expirationTtl: 120 });
+      response.audioUrls = [`${origin}/tts-cache?id=${id}`];
     }
+  } catch (ttsErr) {
+    console.error(JSON.stringify({ event: `${strategy}_tts_fail`, error: String(ttsErr), timestamp: new Date().toISOString() }));
   }
 }
 
@@ -104,14 +90,14 @@ export async function handleIncomingCall(request: Request, env: Env, ctx?: Execu
       ctx?.waitUntil(
         createCallRecord(db, { callId: body.callId, appId: app.id, caller: body.from, callee: body.to })
           .then(() => addTurn(db, { callId: body.callId, turnType: 'greeting', speaker: 'system', content: greetingText }))
-          .catch(() => {}),
+          .catch((err: unknown) => console.error('CDR write failed:', err)),
       );
     }
 
     // Pre-generate greeting audio for direct TTS modes (google, 11labs).
     // Falls through to FreeClimb Say if TTS fails.
     const origin = new URL(request.url).origin;
-    await applyGreetingTTS(response, origin, env, app.voice);
+    await applyTTS(response, origin, env, 'greeting', app.voice);
 
     // Convert app response to FreeClimb PerCL
     const percl = await buildPerCL(response, request.url, getTTSProvider(env));
@@ -164,7 +150,7 @@ export async function handleConversation(
 
     // CDR: detect caller hangup (FreeClimb sends transcribeReason=hangup on disconnect)
     if (body.transcribeReason === 'hangup' && !body.transcript) {
-      if (db) ctx?.waitUntil(endCallRecord(db, body.callId, 'completed').catch(() => {}));
+      if (db) ctx?.waitUntil(endCallRecord(db, body.callId, 'completed').catch((err: unknown) => console.error('CDR write failed:', err)));
       // Still process normally — app.onEnd will fire via the engine
     }
 
@@ -213,7 +199,7 @@ export async function handleConversation(
             ctx?.waitUntil(
               addTurn(db, { callId: body.callId, turnType: 'transfer', speaker: 'system', content: `Transferred to ${targetApp.name}`, meta: { to_app: callAppOverride, warm: true, intent } })
                 .then(() => addTurn(db, { callId: body.callId, turnType: 'caller_speech', speaker: 'caller', content: intent!, meta: { warm_transfer: true } }))
-                .catch(() => {}),
+                .catch((err: unknown) => console.error('CDR write failed:', err)),
             );
           }
           // Fall through to normal processTurn with synthetic input
@@ -221,10 +207,10 @@ export async function handleConversation(
           transferredApp = targetApp;
         } else {
           // Cold transfer — deliver target app's greeting
-          if (db) ctx?.waitUntil(addTurn(db, { callId: body.callId, turnType: 'transfer', speaker: 'system', content: `Transferred to ${targetApp.name}`, meta: { to_app: callAppOverride } }).catch(() => {}));
+          if (db) ctx?.waitUntil(addTurn(db, { callId: body.callId, turnType: 'transfer', speaker: 'system', content: `Transferred to ${targetApp.name}`, meta: { to_app: callAppOverride } }).catch((err: unknown) => console.error('CDR write failed:', err)));
           const greeting = await targetApp.onStart(context);
-          if (db) ctx?.waitUntil(addTurn(db, { callId: body.callId, turnType: 'greeting', speaker: 'system', content: greeting.speech?.text ?? '' }).catch(() => {}));
-          await applyGreetingTTS(greeting, origin, env, targetApp.voice);
+          if (db) ctx?.waitUntil(addTurn(db, { callId: body.callId, turnType: 'greeting', speaker: 'system', content: greeting.speech?.text ?? '' }).catch((err: unknown) => console.error('CDR write failed:', err)));
+          await applyTTS(greeting, origin, env, 'greeting', targetApp.voice);
           const percl = await buildPerCL(greeting, request.url, getTTSProvider(env));
           return Response.json(percl, { headers: { 'Content-Type': 'application/json' } });
         }
@@ -257,14 +243,14 @@ export async function handleConversation(
     if (result.type === 'no-input') {
       console.log(JSON.stringify({ event: 'no_input', callId: body.callId, transcribeReason: body.transcribeReason, timestamp: new Date().toISOString() }));
       // CDR: record no-input turn
-      if (db) ctx?.waitUntil(addTurn(db, { callId: body.callId, turnType: 'no_input', speaker: 'system', content: result.retryPhrase, meta: { transcribeReason: body.transcribeReason } }).catch(() => {}));
+      if (db) ctx?.waitUntil(addTurn(db, { callId: body.callId, turnType: 'no_input', speaker: 'system', content: result.retryPhrase, meta: { transcribeReason: body.transcribeReason } }).catch((err: unknown) => console.error('CDR write failed:', err)));
       return handleNoInputResponse(result.retryPhrase, origin, env, app.voice);
     }
 
     if (result.type === 'stream') {
       // CDR: record caller speech
       if (db && body.transcript) {
-        ctx!.waitUntil(addTurn(db, { callId: body.callId, turnType: 'caller_speech', speaker: 'caller', content: body.transcript }).catch(() => {}));
+        ctx!.waitUntil(addTurn(db, { callId: body.callId, turnType: 'caller_speech', speaker: 'caller', content: body.transcript }).catch((err: unknown) => console.error('CDR write failed:', err)));
       }
 
       // Per-turn UUID prevents stale KV reads
@@ -276,16 +262,16 @@ export async function handleConversation(
         ? async (sentences: string[], hangup: boolean) => {
             const fullText = sentences.join(' ');
             if (fullText) {
-              await addTurn(db, { callId: body.callId, turnType: hangup ? 'goodbye' : 'assistant_response', speaker: 'system', content: fullText }).catch(() => {});
+              await addTurn(db, { callId: body.callId, turnType: hangup ? 'goodbye' : 'assistant_response', speaker: 'system', content: fullText }).catch((err: unknown) => console.error('CDR write failed:', err));
             }
-            if (hangup) await endCallRecord(db, body.callId, 'completed').catch(() => {});
+            if (hangup) await endCallRecord(db, body.callId, 'completed').catch((err: unknown) => console.error('CDR write failed:', err));
           }
         : undefined;
 
       try {
         if (result.preFiller) {
           // CDR: record filler turn
-          if (db) ctx!.waitUntil(addTurn(db, { callId: body.callId, turnType: 'filler', speaker: 'system', content: result.preFiller.phrase }).catch(() => {}));
+          if (db) ctx!.waitUntil(addTurn(db, { callId: body.callId, turnType: 'filler', speaker: 'system', content: result.preFiller.phrase }).catch((err: unknown) => console.error('CDR write failed:', err)));
           return await handlePreFillerStream(result, context, turnId, callKey, origin, env, ctx!, onStreamComplete, app.voice);
         }
         return await handleStandardStream(result, context, turnId, callKey, origin, env, ctx!, onStreamComplete, app.voice);
@@ -296,7 +282,7 @@ export async function handleConversation(
 
       // Streaming failed — fall back to non-streaming via onSpeech
       const fallback = await app.onSpeech(context, input);
-      await applyResponseTTS(fallback, origin, env, app.voice);
+      await applyTTS(fallback, origin, env, 'response', app.voice);
       const percl = await buildPerCL(fallback, request.url, getTTSProvider(env));
       if (fallback.hangup && result.cleanup && ctx) ctx.waitUntil(result.cleanup());
       // CDR: record fallback response
@@ -304,7 +290,7 @@ export async function handleConversation(
         ctx?.waitUntil(
           addTurn(db, { callId: body.callId, turnType: fallback.hangup ? 'goodbye' : 'assistant_response', speaker: 'system', content: fallback.speech.text })
             .then(() => fallback.hangup ? endCallRecord(db, body.callId, 'completed') : undefined)
-            .catch(() => {}),
+            .catch((err: unknown) => console.error('CDR write failed:', err)),
         );
       }
       return Response.json(percl, { headers: { 'Content-Type': 'application/json' } });
@@ -312,14 +298,14 @@ export async function handleConversation(
 
     // type === 'response' — non-streaming path
     // Pre-generate TTS for direct modes (google, 11labs) so buildPerCL emits Play, not Say
-    await applyResponseTTS(result.speech, origin, env, app.voice);
+    await applyTTS(result.speech, origin, env, 'response', app.voice);
 
     // CDR: record caller speech + response
     if (db) {
       const cdrWrites = async () => {
-        if (body.transcript) await addTurn(db, { callId: body.callId, turnType: 'caller_speech', speaker: 'caller', content: body.transcript! }).catch(() => {});
-        if (result.speech.speech?.text) await addTurn(db, { callId: body.callId, turnType: result.speech.hangup ? 'goodbye' : 'assistant_response', speaker: 'system', content: result.speech.speech.text }).catch(() => {});
-        if (result.speech.hangup) await endCallRecord(db, body.callId, 'completed').catch(() => {});
+        if (body.transcript) await addTurn(db, { callId: body.callId, turnType: 'caller_speech', speaker: 'caller', content: body.transcript! }).catch((err: unknown) => console.error('CDR write failed:', err));
+        if (result.speech.speech?.text) await addTurn(db, { callId: body.callId, turnType: result.speech.hangup ? 'goodbye' : 'assistant_response', speaker: 'system', content: result.speech.speech.text }).catch((err: unknown) => console.error('CDR write failed:', err));
+        if (result.speech.hangup) await endCallRecord(db, body.callId, 'completed').catch((err: unknown) => console.error('CDR write failed:', err));
       };
       ctx?.waitUntil(cdrWrites());
     }
@@ -449,7 +435,7 @@ async function handleStandardStream(
         // Generator signaled hangup — brief pause so goodbye doesn't cut off abruptly
         if (cleanup) ctx.waitUntil(cleanup());
         // CDR: record goodbye (single sentence, stream complete)
-        if (onStreamComplete) ctx.waitUntil(onStreamComplete([safeSentence1], true).catch(() => {}));
+        if (onStreamComplete) ctx.waitUntil(onStreamComplete([safeSentence1], true).catch((err: unknown) => console.error('CDR write failed:', err)));
         return Response.json(
           [{ Play: { file: `${origin}/tts-cache?id=${s1Id}` } }, { Pause: { length: 300 } }, { Hangup: {} }],
           { headers: { 'Content-Type': 'application/json' } },
@@ -476,412 +462,4 @@ async function handleStandardStream(
 
   // Stream produced nothing — fall through handled by caller
   throw new Error('Stream produced no usable content');
-}
-
-/**
- * Health check endpoint
- */
-export function handleHealthCheck(): Response {
-  return new Response('voxnos platform running', { status: 200 });
-}
-
-/**
- * List registered apps endpoint
- */
-export function handleListApps(): Response {
-  const apps = registry.list().map(app => ({
-    id: app.id,
-    name: app.name,
-  }));
-  return Response.json(apps);
-}
-
-/**
- * Debug FreeClimb account endpoint
- */
-export async function handleDebugAccount(env: Env): Promise<Response> {
-  const { auth, apiBase } = freeclimbAuth(env);
-
-  try {
-    // Try different API paths
-    const tests = [
-      { name: 'Account', url: `${apiBase}/Accounts/${env.FREECLIMB_ACCOUNT_ID}` },
-      { name: 'IncomingPhoneNumbers (with account)', url: `${apiBase}/Accounts/${env.FREECLIMB_ACCOUNT_ID}/IncomingPhoneNumbers` },
-      { name: 'Applications (with account)', url: `${apiBase}/Accounts/${env.FREECLIMB_ACCOUNT_ID}/Applications` },
-      { name: 'IncomingPhoneNumbers (no account)', url: `${apiBase}/IncomingPhoneNumbers` },
-      { name: 'Applications (no account)', url: `${apiBase}/Applications` },
-      { name: 'Calls', url: `${apiBase}/Calls` },
-    ];
-
-    const results = [];
-
-    for (const test of tests) {
-      const response = await fetch(test.url, {
-        headers: {
-          'Authorization': `Basic ${auth}`,
-        },
-      });
-
-      const data = await response.text();
-      results.push({
-        endpoint: test.name,
-        status: response.status,
-        response: data.substring(0, 200), // First 200 chars
-      });
-    }
-
-    return Response.json({
-      accountId: env.FREECLIMB_ACCOUNT_ID.substring(0, 8) + '...',
-      results,
-    });
-
-  } catch (error) {
-    return Response.json({ error: String(error) }, { status: 500 });
-  }
-}
-
-/**
- * List FreeClimb phone numbers endpoint
- */
-export async function handleListPhoneNumbers(env: Env): Promise<Response> {
-  const { auth, apiBase } = freeclimbAuth(env);
-
-  try {
-    const response = await fetch(`${apiBase}/Accounts/${env.FREECLIMB_ACCOUNT_ID}/IncomingPhoneNumbers`, {
-      headers: {
-        'Authorization': `Basic ${auth}`,
-      },
-    });
-
-    if (!response.ok) {
-      const error = await response.text();
-      return Response.json({ error: 'Failed to fetch phone numbers', details: error }, { status: 500 });
-    }
-
-    const data = await response.json() as {
-      incomingPhoneNumbers: Array<{
-        phoneNumberId: string;
-        phoneNumber: string;
-        alias: string;
-        voiceUrl?: string;
-        applicationId?: string;
-      }>;
-    };
-
-    const phoneNumbers = data.incomingPhoneNumbers || [];
-
-    return Response.json({
-      count: phoneNumbers.length,
-      phoneNumbers: phoneNumbers.map(n => ({
-        id: n.phoneNumberId,
-        number: n.phoneNumber,
-        alias: n.alias,
-        voiceUrl: n.voiceUrl,
-        applicationId: n.applicationId,
-      })),
-    });
-
-  } catch (error) {
-    console.error('Error fetching phone numbers:', error);
-    return Response.json({ error: 'Failed to fetch phone numbers', details: String(error) }, { status: 500 });
-  }
-}
-
-/**
- * Setup FreeClimb application and phone number endpoint
- */
-export async function handleSetup(request: Request, env: Env): Promise<Response> {
-  const body = await request.json() as { phoneNumber?: string };
-  const baseUrl = new URL(request.url).origin;
-
-  const { auth, apiBase } = freeclimbAuth(env);
-
-  try {
-    // Step 1: Create FreeClimb Application
-    console.log('Creating FreeClimb application...');
-    const appResponse = await fetch(`${apiBase}/Accounts/${env.FREECLIMB_ACCOUNT_ID}/Applications`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Basic ${auth}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        alias: 'Voxnos Platform',
-        voiceUrl: `${baseUrl}/call`,
-        voiceFallbackUrl: `${baseUrl}/call`,
-      }),
-    });
-
-    if (!appResponse.ok) {
-      const error = await appResponse.text();
-      return Response.json({ error: 'Failed to create application', details: error }, { status: 500 });
-    }
-
-    const application = await appResponse.json() as { applicationId: string };
-    console.log('Application created:', application.applicationId);
-
-    // Step 2: Get phone numbers
-    console.log('Fetching phone numbers...');
-    const numbersResponse = await fetch(`${apiBase}/Accounts/${env.FREECLIMB_ACCOUNT_ID}/IncomingPhoneNumbers`, {
-      headers: {
-        'Authorization': `Basic ${auth}`,
-      },
-    });
-
-    if (!numbersResponse.ok) {
-      const error = await numbersResponse.text();
-      return Response.json({ error: 'Failed to fetch phone numbers', details: error }, { status: 500 });
-    }
-
-    const numbersData = await numbersResponse.json() as {
-      incomingPhoneNumbers: Array<{
-        phoneNumberId: string;
-        phoneNumber: string;
-        alias: string;
-      }>;
-    };
-
-    const phoneNumbers = numbersData.incomingPhoneNumbers || [];
-
-    if (phoneNumbers.length === 0) {
-      return Response.json({
-        error: 'No phone numbers found',
-        application: { id: application.applicationId, voiceUrl: `${baseUrl}/call` },
-      });
-    }
-
-    // Step 3: Update phone number to use the application
-    const targetNumber = body.phoneNumber
-      ? phoneNumbers.find(n => n.phoneNumber === body.phoneNumber)
-      : phoneNumbers[0]; // Use first number if none specified
-
-    if (!targetNumber) {
-      return Response.json({
-        error: 'Phone number not found',
-        available: phoneNumbers.map(n => n.phoneNumber),
-        application: { id: application.applicationId, voiceUrl: `${baseUrl}/call` },
-      });
-    }
-
-    console.log(`Configuring phone number ${targetNumber.phoneNumber}...`);
-    const updateResponse = await fetch(
-      `${apiBase}/Accounts/${env.FREECLIMB_ACCOUNT_ID}/IncomingPhoneNumbers/${targetNumber.phoneNumberId}`,
-      {
-        method: 'POST',
-        headers: {
-          'Authorization': `Basic ${auth}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          applicationId: application.applicationId,
-        }),
-      }
-    );
-
-    if (!updateResponse.ok) {
-      const error = await updateResponse.text();
-      return Response.json({ error: 'Failed to update phone number', details: error }, { status: 500 });
-    }
-
-    return Response.json({
-      success: true,
-      application: {
-        id: application.applicationId,
-        name: 'Voxnos Platform',
-        voiceUrl: `${baseUrl}/call`,
-      },
-      phoneNumber: {
-        id: targetNumber.phoneNumberId,
-        number: targetNumber.phoneNumber,
-        configured: true,
-      },
-      message: `Call ${targetNumber.phoneNumber} to test the Claude assistant!`,
-    });
-
-  } catch (error) {
-    console.error('Setup error:', error);
-    return Response.json({ error: 'Setup failed', details: String(error) }, { status: 500 });
-  }
-}
-
-/**
- * Update phone number alias endpoint
- */
-export async function handleUpdatePhoneNumber(request: Request, env: Env): Promise<Response> {
-  const body = await request.json() as { phoneNumberId: string; alias?: string };
-
-  const { auth, apiBase } = freeclimbAuth(env);
-
-  try {
-    const updateResponse = await fetch(
-      `${apiBase}/Accounts/${env.FREECLIMB_ACCOUNT_ID}/IncomingPhoneNumbers/${body.phoneNumberId}`,
-      {
-        method: 'POST',
-        headers: {
-          'Authorization': `Basic ${auth}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          alias: body.alias,
-        }),
-      }
-    );
-
-    if (!updateResponse.ok) {
-      const error = await updateResponse.text();
-      return Response.json({ error: 'Failed to update phone number', details: error }, { status: 500 });
-    }
-
-    const updated = await updateResponse.json();
-
-    return Response.json({
-      success: true,
-      phoneNumber: updated,
-    });
-
-  } catch (error) {
-    console.error('Update error:', error);
-    return Response.json({ error: 'Update failed', details: String(error) }, { status: 500 });
-  }
-}
-
-/**
- * Get FreeClimb logs endpoint
- */
-export async function handleGetLogs(request: Request, env: Env): Promise<Response> {
-  const url = new URL(request.url);
-  const callId = url.searchParams.get('callId');
-
-  const { auth, apiBase } = freeclimbAuth(env);
-
-  try {
-    let logsUrl: string;
-
-    if (callId) {
-      // Get logs for specific call
-      logsUrl = `${apiBase}/Accounts/${env.FREECLIMB_ACCOUNT_ID}/Calls/${callId}/Logs`;
-    } else {
-      // Get recent logs (last 50)
-      logsUrl = `${apiBase}/Accounts/${env.FREECLIMB_ACCOUNT_ID}/Logs`;
-    }
-
-    const response = await fetch(logsUrl, {
-      headers: {
-        'Authorization': `Basic ${auth}`,
-      },
-    });
-
-    if (!response.ok) {
-      const error = await response.text();
-      return Response.json({
-        error: 'Failed to fetch logs',
-        details: error,
-        url: logsUrl
-      }, { status: response.status });
-    }
-
-    const logs = await response.json();
-
-    return Response.json(logs);
-
-  } catch (error) {
-    console.error('Error fetching logs:', error);
-    return Response.json({ error: 'Failed to fetch logs', details: String(error) }, { status: 500 });
-  }
-}
-
-/**
- * Update FreeClimb application URLs endpoint
- */
-export async function handleUpdateApplication(request: Request, env: Env): Promise<Response> {
-  const baseUrl = new URL(request.url).origin;
-  const { auth, apiBase } = freeclimbAuth(env);
-
-  try {
-    // Step 1: List all applications to find the Voxnos one
-    console.log('Fetching applications...');
-    const appsResponse = await fetch(`${apiBase}/Accounts/${env.FREECLIMB_ACCOUNT_ID}/Applications`, {
-      headers: {
-        'Authorization': `Basic ${auth}`,
-      },
-    });
-
-    if (!appsResponse.ok) {
-      const error = await appsResponse.text();
-      return Response.json({ error: 'Failed to fetch applications', details: error }, { status: 500 });
-    }
-
-    const appsData = await appsResponse.json() as {
-      applications: Array<{
-        applicationId: string;
-        alias: string;
-        voiceUrl: string;
-        voiceFallbackUrl?: string;
-      }>;
-    };
-
-    const apps = appsData.applications || [];
-    const voxnosApp = apps.find(app => app.alias === 'Voxnos Platform');
-
-    if (!voxnosApp) {
-      return Response.json({
-        error: 'Voxnos Platform application not found',
-        availableApps: apps.map(a => ({ id: a.applicationId, name: a.alias })),
-      });
-    }
-
-    console.log(`Found Voxnos app: ${voxnosApp.applicationId}, current voiceUrl: ${voxnosApp.voiceUrl}`);
-
-    // Step 2: Update the application's voiceUrl
-    const newVoiceUrl = `${baseUrl}/call`;
-
-    if (voxnosApp.voiceUrl === newVoiceUrl) {
-      return Response.json({
-        message: 'Application already configured correctly',
-        application: {
-          id: voxnosApp.applicationId,
-          voiceUrl: voxnosApp.voiceUrl,
-        },
-      });
-    }
-
-    console.log(`Updating voiceUrl to: ${newVoiceUrl}`);
-    const updateResponse = await fetch(
-      `${apiBase}/Accounts/${env.FREECLIMB_ACCOUNT_ID}/Applications/${voxnosApp.applicationId}`,
-      {
-        method: 'POST',
-        headers: {
-          'Authorization': `Basic ${auth}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          voiceUrl: newVoiceUrl,
-          voiceFallbackUrl: newVoiceUrl,
-        }),
-      }
-    );
-
-    if (!updateResponse.ok) {
-      const error = await updateResponse.text();
-      return Response.json({ error: 'Failed to update application', details: error }, { status: 500 });
-    }
-
-    const updated = await updateResponse.json();
-
-    return Response.json({
-      success: true,
-      message: 'Application updated successfully',
-      before: {
-        voiceUrl: voxnosApp.voiceUrl,
-      },
-      after: {
-        voiceUrl: newVoiceUrl,
-      },
-      application: updated,
-    });
-
-  } catch (error) {
-    console.error('Update application error:', error);
-    return Response.json({ error: 'Update failed', details: String(error) }, { status: 500 });
-  }
 }
