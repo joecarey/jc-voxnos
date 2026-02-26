@@ -18,6 +18,7 @@ import {
   handleHealthCheck, handleListApps, handleDebugAccount,
   handleListPhoneNumbers, handleSetup, handleUpdatePhoneNumber,
   handleGetLogs, handleUpdateApplication,
+  handleAvailableNumbers, handleBuyNumber,
 } from './telephony/freeclimb-admin.js';
 import { requireAdmin, requireD1 } from './admin/helpers.js';
 import {
@@ -227,6 +228,18 @@ export default {
       const denied = await requireAdmin(request, env);
       if (denied) return denied;
       return handleListPhoneNumbers(env);
+    }
+
+    if (url.pathname === '/available-numbers' && request.method === 'GET') {
+      const denied = await requireAdmin(request, env);
+      if (denied) return denied;
+      return handleAvailableNumbers(request, env);
+    }
+
+    if (url.pathname === '/buy-number' && request.method === 'POST') {
+      const denied = await requireAdmin(request, env);
+      if (denied) return denied;
+      return handleBuyNumber(request, env);
     }
 
     if (url.pathname === '/setup' && request.method === 'POST') {

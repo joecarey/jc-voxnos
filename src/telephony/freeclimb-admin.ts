@@ -324,6 +324,137 @@ export async function handleGetLogs(request: Request, env: Env): Promise<Respons
 }
 
 /**
+ * Search for available phone numbers to buy.
+ * GET /available-numbers?region=TX&sms=true
+ */
+export async function handleAvailableNumbers(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const { auth, apiBase } = freeclimbAuth(env);
+
+  try {
+    const searchUrl = new URL(`${apiBase}/AvailablePhoneNumbers`);
+    const region = url.searchParams.get('region');
+    if (region) searchUrl.searchParams.set('region', region);
+    const country = url.searchParams.get('country');
+    if (country) searchUrl.searchParams.set('country', country);
+    const phoneNumber = url.searchParams.get('phoneNumber');
+    if (phoneNumber) searchUrl.searchParams.set('phoneNumber', phoneNumber);
+    searchUrl.searchParams.set('capabilities.voice', 'true');
+    if (url.searchParams.get('sms') === 'true') {
+      searchUrl.searchParams.set('capabilities.sms', 'true');
+    }
+
+    const response = await fetch(searchUrl.toString(), {
+      headers: { 'Authorization': `Basic ${auth}` },
+    });
+
+    if (!response.ok) {
+      const error = await response.text();
+      return Response.json({ error: 'Failed to search available numbers', details: error }, { status: 500 });
+    }
+
+    const data = await response.json() as {
+      total: number;
+      availablePhoneNumbers: Array<{
+        phoneNumber: string;
+        alias: string;
+        region: string;
+        country: string;
+        capabilities: { voice: boolean; sms: boolean; tollFree: boolean };
+      }>;
+    };
+
+    const numbers = data.availablePhoneNumbers || [];
+    return Response.json({
+      total: data.total,
+      count: numbers.length,
+      numbers: numbers.map(n => ({
+        number: n.phoneNumber,
+        alias: n.alias,
+        region: n.region,
+        country: n.country,
+        capabilities: n.capabilities,
+      })),
+    });
+  } catch (error) {
+    return Response.json({ error: 'Search failed', details: String(error) }, { status: 500 });
+  }
+}
+
+/**
+ * Buy an available phone number and assign it to the Voxnos Platform application.
+ * POST /buy-number { "phoneNumber": "+1...", "alias": "AssistRX FAQ" }
+ */
+export async function handleBuyNumber(request: Request, env: Env): Promise<Response> {
+  const body = await request.json() as { phoneNumber: string; alias?: string };
+  if (!body.phoneNumber) {
+    return Response.json({ error: 'phoneNumber is required (E.164 format)' }, { status: 400 });
+  }
+
+  const { auth, apiBase } = freeclimbAuth(env);
+
+  try {
+    // Find the Voxnos Platform application so the new number routes calls correctly
+    const appsResponse = await fetch(`${apiBase}/Accounts/${env.FREECLIMB_ACCOUNT_ID}/Applications`, {
+      headers: { 'Authorization': `Basic ${auth}` },
+    });
+    if (!appsResponse.ok) {
+      const error = await appsResponse.text();
+      return Response.json({ error: 'Failed to fetch applications', details: error }, { status: 500 });
+    }
+    const appsData = await appsResponse.json() as {
+      applications: Array<{ applicationId: string; alias: string }>;
+    };
+    const voxnosApp = (appsData.applications || []).find(a => a.alias === 'Voxnos Platform');
+    if (!voxnosApp) {
+      return Response.json({ error: 'Voxnos Platform application not found. Run /setup first.' }, { status: 404 });
+    }
+
+    // Buy the number and attach to application
+    const buyResponse = await fetch(
+      `${apiBase}/Accounts/${env.FREECLIMB_ACCOUNT_ID}/IncomingPhoneNumbers`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Basic ${auth}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          phoneNumber: body.phoneNumber,
+          alias: body.alias || '',
+          applicationId: voxnosApp.applicationId,
+        }),
+      },
+    );
+
+    if (!buyResponse.ok) {
+      const error = await buyResponse.text();
+      return Response.json({ error: 'Failed to buy number', details: error }, { status: 500 });
+    }
+
+    const purchased = await buyResponse.json() as {
+      phoneNumberId: string;
+      phoneNumber: string;
+      alias: string;
+      applicationId: string;
+    };
+
+    return Response.json({
+      success: true,
+      phoneNumber: {
+        id: purchased.phoneNumberId,
+        number: purchased.phoneNumber,
+        alias: purchased.alias,
+        applicationId: purchased.applicationId,
+      },
+      message: `Purchased ${purchased.phoneNumber} and assigned to Voxnos Platform.`,
+    });
+  } catch (error) {
+    return Response.json({ error: 'Buy failed', details: String(error) }, { status: 500 });
+  }
+}
+
+/**
  * Update FreeClimb application URLs endpoint
  */
 export async function handleUpdateApplication(request: Request, env: Env): Promise<Response> {
