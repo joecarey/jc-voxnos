@@ -117,13 +117,15 @@ export async function deletePhoneRoute(db: D1Database, phoneNumber: string): Pro
 // --- Phone number normalization ---
 
 /** Normalize a phone number to E.164 format (+1XXXXXXXXXX for US numbers).
+ *  Returns null if the input can't be parsed into a valid number.
  *  Handles: 8472742489, 18472742489, +18472742489, (847) 274-2489, etc. */
-export function normalizeE164(input: string): string {
+export function normalizeE164(input: string): string | null {
   const digits = input.replace(/\D/g, '');
   if (digits.length === 10) return `+1${digits}`;
   if (digits.length === 11 && digits.startsWith('1')) return `+${digits}`;
-  if (input.startsWith('+')) return input;
-  return `+${digits}`;
+  // Non-US international numbers: must already have + prefix and 7-15 digits (ITU E.164 spec)
+  if (input.startsWith('+') && digits.length >= 7 && digits.length <= 15) return `+${digits}`;
+  return null;
 }
 
 // --- Allowed callers (per inbound number) ---
@@ -151,7 +153,7 @@ export async function loadAllowedCallers(db: D1Database): Promise<Map<string, Se
 /** List all allowed callers, optionally filtered by inbound number. */
 export async function listAllowedCallers(db: D1Database, inboundNumber?: string): Promise<AllowedCallerRow[]> {
   const query = inboundNumber
-    ? db.prepare('SELECT * FROM allowed_callers WHERE inbound_number = ? ORDER BY created_at').bind(normalizeE164(inboundNumber))
+    ? db.prepare('SELECT * FROM allowed_callers WHERE inbound_number = ? ORDER BY created_at').bind(normalizeE164(inboundNumber) ?? inboundNumber)
     : db.prepare('SELECT * FROM allowed_callers ORDER BY inbound_number, created_at');
   const { results } = await query.all();
   return (results as Record<string, unknown>[]).map(r => ({
@@ -162,12 +164,13 @@ export async function listAllowedCallers(db: D1Database, inboundNumber?: string)
   }));
 }
 
-/** Add a caller to the allowlist for a specific inbound number. Numbers are normalized to E.164. */
+/** Add a caller to the allowlist for a specific inbound number.
+ *  Caller must pre-validate with normalizeE164 — this function trusts its input. */
 export async function addAllowedCaller(db: D1Database, inboundNumber: string, callerNumber: string, label?: string): Promise<boolean> {
   try {
     await db
       .prepare('INSERT OR REPLACE INTO allowed_callers (inbound_number, caller_number, label) VALUES (?, ?, ?)')
-      .bind(normalizeE164(inboundNumber), normalizeE164(callerNumber), label ?? null)
+      .bind(inboundNumber, callerNumber, label ?? null)
       .run();
     return true;
   } catch (err) {
@@ -176,11 +179,12 @@ export async function addAllowedCaller(db: D1Database, inboundNumber: string, ca
   }
 }
 
-/** Remove a caller from the allowlist for a specific inbound number. Numbers are normalized to E.164. */
+/** Remove a caller from the allowlist for a specific inbound number.
+ *  Caller must pre-validate with normalizeE164 — this function trusts its input. */
 export async function removeAllowedCaller(db: D1Database, inboundNumber: string, callerNumber: string): Promise<boolean> {
   const { meta } = await db
     .prepare('DELETE FROM allowed_callers WHERE inbound_number = ? AND caller_number = ?')
-    .bind(normalizeE164(inboundNumber), normalizeE164(callerNumber))
+    .bind(inboundNumber, callerNumber)
     .run();
   return (meta.changes ?? 0) > 0;
 }
@@ -193,12 +197,13 @@ export async function loadAllowlistEnabled(db: D1Database): Promise<Set<string>>
   return new Set((results as Record<string, unknown>[]).map(r => r.inbound_number as string));
 }
 
-/** Enable allowlist enforcement for an inbound number. Number is normalized to E.164. */
+/** Enable allowlist enforcement for an inbound number.
+ *  Caller must pre-validate with normalizeE164 — this function trusts its input. */
 export async function enableAllowlist(db: D1Database, inboundNumber: string): Promise<boolean> {
   try {
     await db
       .prepare('INSERT OR IGNORE INTO allowlist_enabled (inbound_number) VALUES (?)')
-      .bind(normalizeE164(inboundNumber))
+      .bind(inboundNumber)
       .run();
     return true;
   } catch (err) {
@@ -207,11 +212,12 @@ export async function enableAllowlist(db: D1Database, inboundNumber: string): Pr
   }
 }
 
-/** Disable allowlist enforcement for an inbound number. Number is normalized to E.164. */
+/** Disable allowlist enforcement for an inbound number.
+ *  Caller must pre-validate with normalizeE164 — this function trusts its input. */
 export async function disableAllowlist(db: D1Database, inboundNumber: string): Promise<boolean> {
   const { meta } = await db
     .prepare('DELETE FROM allowlist_enabled WHERE inbound_number = ?')
-    .bind(normalizeE164(inboundNumber))
+    .bind(inboundNumber)
     .run();
   return (meta.changes ?? 0) > 0;
 }

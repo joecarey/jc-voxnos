@@ -25,10 +25,12 @@ export async function reloadAllowedCallers(db: D1Database): Promise<number> {
 
 /** Check if a caller is allowed to reach a specific inbound number.
  *  Returns true if allowlist is not enabled for that number, or if the caller is listed.
- *  Both numbers are normalized to E.164 before comparison. */
+ *  Both numbers are normalized to E.164 before comparison.
+ *  If either number can't be parsed, fails open (allows the call). */
 export function isCallerAllowed(inboundNumber: string, callerNumber: string): boolean {
   const inbound = normalizeE164(inboundNumber);
   const caller = normalizeE164(callerNumber);
+  if (!inbound || !caller) return true; // can't parse = fail open
   if (!enabledNumbers.has(inbound)) return true; // enforcement off
   const set = allowedCallers.get(inbound);
   if (!set || set.size === 0) return true; // enabled but no entries = open

@@ -6,7 +6,7 @@ import { z } from "zod";
 import type { Env } from "./engine/types.js";
 import { freeclimbAuth } from "./telephony/freeclimb-admin.js";
 import { registry } from "./engine/registry.js";
-import { listAppDefinitions, loadPhoneRoutes, savePhoneRoute, listAllowedCallers, addAllowedCaller, removeAllowedCaller, loadAllowlistEnabled, enableAllowlist, disableAllowlist } from "./services/app-store.js";
+import { listAppDefinitions, loadPhoneRoutes, savePhoneRoute, listAllowedCallers, addAllowedCaller, removeAllowedCaller, loadAllowlistEnabled, enableAllowlist, disableAllowlist, normalizeE164 } from "./services/app-store.js";
 import { listCallRecords, getCallRecord, getCallTurns } from "./services/cdr-store.js";
 import { listSurveyResults } from "./services/survey-store.js";
 import { reloadAllowedCallers } from "./services/caller-allowlist.js";
@@ -433,17 +433,25 @@ export function createServer(env: Env): McpServer {
     }
   );
 
+  // --- Validation helper for allowlist tools ---
+  const badNumber = (raw: string) => ({
+    content: [{ type: "text" as const, text: `Invalid phone number: "${raw}". Expected a US number like 8472742489, (847) 274-2489, or +18472742489.` }],
+    isError: true as const,
+  });
+
   // --- allowed_callers ---
   server.tool(
     "allowed_callers",
     "Show caller allowlist status — which numbers have enforcement enabled, and which callers are listed. Entries are inert until enforcement is enabled via enable_allowlist.",
     {
-      inbound_number: z.string().optional().describe("Filter by inbound number in E.164 format. Omit to see all."),
+      inbound_number: z.string().optional().describe("Filter by inbound number. Any format accepted (e.g. '8472742489')."),
     },
     async ({ inbound_number }) => {
       if (!env.DB) {
         return { content: [{ type: "text" as const, text: "D1 database not configured" }], isError: true };
       }
+      if (inbound_number && !normalizeE164(inbound_number)) return badNumber(inbound_number);
+
       const [callers, enabled] = await Promise.all([
         listAllowedCallers(env.DB, inbound_number),
         loadAllowlistEnabled(env.DB),
@@ -480,20 +488,23 @@ export function createServer(env: Env): McpServer {
     "enable_allowlist",
     "Enable caller allowlist enforcement for an inbound number. Only callers on the list will be able to reach this number. Add callers first with allow_caller.",
     {
-      inbound_number: z.string().describe("The inbound phone number to lock down, in E.164 format"),
+      inbound_number: z.string().describe("The inbound phone number to lock down. Any format accepted."),
     },
     async ({ inbound_number }) => {
       if (!env.DB) {
         return { content: [{ type: "text" as const, text: "D1 database not configured" }], isError: true };
       }
-      await enableAllowlist(env.DB, inbound_number);
+      const normalized = normalizeE164(inbound_number);
+      if (!normalized) return badNumber(inbound_number);
+
+      await enableAllowlist(env.DB, normalized);
       await reloadAllowedCallers(env.DB);
-      const callers = await listAllowedCallers(env.DB, inbound_number);
+      const callers = await listAllowedCallers(env.DB, normalized);
       const note = callers.length
         ? ` ${callers.length} caller(s) can reach it.`
         : " Warning: no callers listed yet — all calls will be blocked. Add callers with allow_caller.";
       return {
-        content: [{ type: "text" as const, text: `Allowlist enforcement **enabled** for **${inbound_number}**.${note}` }],
+        content: [{ type: "text" as const, text: `Allowlist enforcement **enabled** for **${normalized}**.${note}` }],
       };
     }
   );
@@ -503,19 +514,22 @@ export function createServer(env: Env): McpServer {
     "disable_allowlist",
     "Disable caller allowlist enforcement for an inbound number. All callers will be able to reach it. Existing allowlist entries are preserved for re-enabling later.",
     {
-      inbound_number: z.string().describe("The inbound phone number to open up, in E.164 format"),
+      inbound_number: z.string().describe("The inbound phone number to open up. Any format accepted."),
     },
     async ({ inbound_number }) => {
       if (!env.DB) {
         return { content: [{ type: "text" as const, text: "D1 database not configured" }], isError: true };
       }
-      const was = await disableAllowlist(env.DB, inbound_number);
+      const normalized = normalizeE164(inbound_number);
+      if (!normalized) return badNumber(inbound_number);
+
+      const was = await disableAllowlist(env.DB, normalized);
       await reloadAllowedCallers(env.DB);
       if (!was) {
-        return { content: [{ type: "text" as const, text: `Allowlist was already disabled for ${inbound_number}.` }] };
+        return { content: [{ type: "text" as const, text: `Allowlist was already disabled for ${normalized}.` }] };
       }
       return {
-        content: [{ type: "text" as const, text: `Allowlist enforcement **disabled** for **${inbound_number}**. All callers can now reach it. Entries preserved.` }],
+        content: [{ type: "text" as const, text: `Allowlist enforcement **disabled** for **${normalized}**. All callers can now reach it. Entries preserved.` }],
       };
     }
   );
@@ -525,21 +539,26 @@ export function createServer(env: Env): McpServer {
     "allow_caller",
     "Add a caller to the allowlist for a specific inbound number. The entry is stored but only enforced when enable_allowlist is on for that number.",
     {
-      inbound_number: z.string().describe("The inbound phone number to protect, in E.164 format"),
-      caller_number: z.string().describe("The caller phone number to allow, in E.164 format"),
+      inbound_number: z.string().describe("The inbound phone number to protect. Any format accepted."),
+      caller_number: z.string().describe("The caller phone number to allow. Any format accepted."),
       label: z.string().optional().describe("Optional label for this caller (e.g. 'Joe', 'Mom')"),
     },
     async ({ inbound_number, caller_number, label }) => {
       if (!env.DB) {
         return { content: [{ type: "text" as const, text: "D1 database not configured" }], isError: true };
       }
-      const ok = await addAllowedCaller(env.DB, inbound_number, caller_number, label);
+      const normInbound = normalizeE164(inbound_number);
+      if (!normInbound) return badNumber(inbound_number);
+      const normCaller = normalizeE164(caller_number);
+      if (!normCaller) return badNumber(caller_number);
+
+      const ok = await addAllowedCaller(env.DB, normInbound, normCaller, label);
       if (!ok) {
         return { content: [{ type: "text" as const, text: "Failed to add caller" }], isError: true };
       }
       const count = await reloadAllowedCallers(env.DB);
       return {
-        content: [{ type: "text" as const, text: `Allowed **${caller_number}**${label ? ` (${label})` : ""} → **${inbound_number}**. ${count} total entry/entries.` }],
+        content: [{ type: "text" as const, text: `Allowed **${normCaller}**${label ? ` (${label})` : ""} → **${normInbound}**. ${count} total entry/entries.` }],
       };
     }
   );
@@ -549,21 +568,26 @@ export function createServer(env: Env): McpServer {
     "block_caller",
     "Remove a caller from the allowlist for a specific inbound number.",
     {
-      inbound_number: z.string().describe("The inbound phone number in E.164 format"),
-      caller_number: z.string().describe("The caller phone number to remove in E.164 format"),
+      inbound_number: z.string().describe("The inbound phone number. Any format accepted."),
+      caller_number: z.string().describe("The caller phone number to remove. Any format accepted."),
     },
     async ({ inbound_number, caller_number }) => {
       if (!env.DB) {
         return { content: [{ type: "text" as const, text: "D1 database not configured" }], isError: true };
       }
-      const removed = await removeAllowedCaller(env.DB, inbound_number, caller_number);
+      const normInbound = normalizeE164(inbound_number);
+      if (!normInbound) return badNumber(inbound_number);
+      const normCaller = normalizeE164(caller_number);
+      if (!normCaller) return badNumber(caller_number);
+
+      const removed = await removeAllowedCaller(env.DB, normInbound, normCaller);
       if (!removed) {
-        return { content: [{ type: "text" as const, text: `${caller_number} was not on the allowlist for ${inbound_number}.` }] };
+        return { content: [{ type: "text" as const, text: `${normCaller} was not on the allowlist for ${normInbound}.` }] };
       }
       const count = await reloadAllowedCallers(env.DB);
       const note = count === 0 ? " All allowlists are now empty." : ` ${count} total entry/entries remaining.`;
       return {
-        content: [{ type: "text" as const, text: `Removed **${caller_number}** from **${inbound_number}** allowlist.${note}` }],
+        content: [{ type: "text" as const, text: `Removed **${normCaller}** from **${normInbound}** allowlist.${note}` }],
       };
     }
   );
