@@ -13,7 +13,7 @@ export interface Env {
   GOOGLE_TTS_API_KEY?: string;  // required when TTS_MODE=google
   TTS_MODE?: string;  // 'freeclimb' (default) | '11labs' | 'google'
   COGNOS_PUBLIC_KEY: string;
-  COGNOS: Fetcher;  // Service binding to jc-cognos Worker
+  COGNOS: Fetcher;  // Service binding to cognos Worker
   DB?: D1Database;  // D1 database for persistent survey results (optional — KV fallback if absent)
 }
 
