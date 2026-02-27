@@ -1,4 +1,4 @@
-name = "jc-voxnos"
+name = "voxnos"
 main = "src/index.ts"
 compatibility_date = "2024-01-01"
 compatibility_flags = ["nodejs_compat"]
@@ -12,9 +12,9 @@ TTS_MODE = "google"
 
 [[d1_databases]]
 binding = "DB"
-database_name = "jc-voxnos"
+database_name = "voxnos"
 database_id = "0998cfff-5efd-4b08-9186-4a3d4f528e98"
 
 [[services]]
 binding = "COGNOS"
-service = "jc-cognos"
+service = "cognos"

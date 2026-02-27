@@ -1,4 +1,4 @@
-# jc-voxnos
+# voxnos
 
 Multi-app voice platform: FreeClimb telephony + Claude Sonnet 4.6 + Google Chirp 3 HD TTS.
 
@@ -120,7 +120,7 @@ Apps can transfer a call to another app mid-session using the `transfer_to_app` 
 | `survey:{callId}` | JSON survey state | 15min | in-flight survey progress (question index + answers) |
 | `survey-results:{callId}` | JSON results + summary | 24hr | completed survey fallback (when D1 is unavailable) |
 
-## D1 Schema (DB — jc-voxnos)
+## D1 Schema (DB — voxnos)
 
 ### `survey_results` table
 
@@ -282,14 +282,14 @@ Creating a new app: `POST /apps/definitions` with type `conversational` or `surv
 - **Codebase refactoring — file splits, dead code removal, CDR hardening**: Deleted `src/apps/otto.ts` (524-line dormant snapshot). Removed dead `addTurnsBatch` from `cdr-store.ts`. Added UNIQUE constraint retry in `addTurn` for concurrent seq assignment. Replaced 15 silent `.catch(() => {})` CDR writes in `routes.ts` with `console.error` logging. Extracted FreeClimb admin wrappers from `routes.ts` into `src/telephony/freeclimb-admin.ts` (8 handlers). Consolidated `applyGreetingTTS` + `applyResponseTTS` into single `applyTTS(response, origin, env, strategy, voice?)` with `'greeting' | 'response'` discriminator. Split `index.ts` (647→271 lines) into `src/admin/` directory: `validation.ts` (input validation), `helpers.ts` (auth + D1 gates), `routes.ts` (all admin endpoint handlers + `registerAppFromDefinition`). `routes.ts` reduced from 887 to ~470 lines (call webhooks only).
 - **SurveyApp scale parser: ASR mistranscription tolerance**: FreeClimb ASR frequently mistranscribes single-word numeric responses (e.g. "five"→"bye", "four"→"for"/"or"). `parseAnswer` scale branch now includes a `scaleMap` of common ASR near-misses alongside standard word forms (`bye`→5, `for`/`or`→4, `free`/`tree`→3, `to`/`too`/`do`→2, `won`→1). Voice assignments rotated: Ava=Aoede, River=Despina, Coco=Leda (D1 `app_definitions` updated, no code change).
 - **SurveyApp TTS fix + three-tier error escalation**: Non-streaming responses (SurveyApp, streaming fallback) now pre-generate Google TTS audio via `applyResponseTTS` before `buildPerCL`, preventing voice drop to FreeClimb's built-in Say. Three-tier error escalation in `SurveyApp.onSpeech`: tier 1 gentle re-ask, tier 2 rephrased last-chance prompt, tier 3 graceful bail with apology + hangup. Global error cap: 5 total parse failures across all questions triggers immediate bail. `SurveyState` extended with `retriesForQuestion` and `totalErrors` counters; per-question counter resets on successful parse.
-- **D1 database rename**: Renamed `jc-voxnos-surveys` → `jc-voxnos` to reflect the database's broader scope (app definitions, phone routes, CDR, and survey results — not just surveys). Schema and data migrated to new database, old one deleted. `wrangler.toml` binding updated.
+- **D1 database rename**: Renamed `voxnos-surveys` → `voxnos` to reflect the database's broader scope (app definitions, phone routes, CDR, and survey results — not just surveys). Schema and data migrated to new database, old one deleted. `wrangler.toml` binding updated.
 - **Per-app TTS voices + River prompt polish**: Each app can now set `config.voice` in its D1 definition (full Google voice name, e.g. `en-US-Chirp3-HD-Leda`). Voice threads from `VoxnosApp.voice` through `callTTS`, `voiceSlug`, `applyGreetingTTS`, and `processRemainingStream` via `StreamOpts.voice`. Cache keys include the per-app voice slug, preventing cross-app cache collisions. Apps without a voice field use the global default (Despina). Current assignments: Ava=Despina, River=Leda, Coco=Aoede. River's system prompt updated to avoid call-medium references ("have a great call" → "have a good day").
 - **Warm transfer + River prompt hardening**: `transfer_to_app` tool now accepts optional `caller_intent` field. When present, writes `call-transfer-context:{callId}` to KV with the caller's request summary. Route handler forks on transfer: warm path (intent + ConversationalApp target) skips `onStart()`, injects intent as synthetic `SpeechInput`, falls through to `processTurn()` — target Claude responds directly without greeting. Cold path (no intent or SurveyApp target) delivers greeting as before. River's system prompt rewritten: voice-mode guard (no emojis/markdown), people-not-apps framing (Ava and Coco as colleagues), 3-strike intent escalation (suggest → insist → apologize+hangup), and warm transfer instructions (populate `caller_intent` for specific requests, leave empty for generic "let me talk to Ava"). Two-key KV design (durable override + one-shot pending flag) preserved from prior fix for eventual-consistency races.
 - **River intent router + internal call transfer**: River is a D1-defined ConversationalApp (`is_default: true`) that greets callers, classifies intent via Claude, and transfers to the right app using `transfer_to_app` tool. Transfer mechanism: `TransferTool` writes `call-app:{callId}` → app ID to KV; route handler detects pending flag on the next webhook, clears conversation history, delivers target app response. `ToolContext` interface added to `src/tools/types.ts` — threads `{ callId, env }` through `ToolRegistry.execute()` and both `streamClaude`/`callClaude` tool-use loops. Backward-compatible: existing tools ignore the extra param. `applyGreetingTTS()` helper extracted in `routes.ts` to share greeting TTS logic between initial calls and transfers. Direct phone lines: Ava (+15123083004) and Coco (+15122712496) bypass River via `phone_routes`. New file: `src/tools/transfer.ts`.
 - **Call Detail Records (CDR)**: D1-backed call logging with `call_records` and `call_turns` tables. Every call is recorded at start, every event (greeting, caller speech, assistant response, filler, no-input, goodbye) written as a turn with the actual text content. Streaming responses collected via `onStreamComplete` callback in `processRemainingStream` and written as a single joined `assistant_response` turn. All CDR writes are fire-and-forget — never block the call. Admin endpoints: `GET /cdr` (list with pagination/filters) and `GET /cdr/:callId` (full turn-by-turn detail). New `src/services/cdr-store.ts` data access module. `StreamOpts` extended with `onStreamComplete` callback.
 - **D1-driven app definitions + phone routing**: All app configs (conversational and survey) now live in D1 `app_definitions` table with a `type` discriminator and JSON `config` blob. `survey_definitions` table dropped. Worker startup loads active definitions from D1 and registers `ConversationalApp` or `SurveyApp` instances dynamically. New admin endpoints: `GET/POST /apps/definitions`, `GET/DELETE /apps/definitions/:id`, `POST /reload-apps`. Old `/surveys` and `/reload-surveys` endpoints removed. Per-app tool filtering via `ClaudeConfig.toolNames` — tools are code implementations, tool *assignment* is data. Phone number routing via `phone_routes` table: `GET/POST /phone-routes`, `DELETE /phone-routes/:phoneNumber`. Registry tracks `dynamic` flag and `phoneRoutes` map. D1 fallback: code-defined `AvaAssistant`/`RitaAssistant` registered if D1 unavailable. `src/services/app-store.ts` added for D1 data access. `survey-store.ts` slimmed to results-only (definition CRUD removed).
 - **Codebase reorganization**: Replaced monolithic `src/core/` with purpose-aligned directories: `src/engine/` (app framework + turn cycle), `src/services/` (Claude client, conversation, survey store), `src/telephony/` (FreeClimb routes + PerCL), `src/platform/` (auth, rate limiting, env). SurveyApp moved from `apps/survey.ts` to `engine/survey-app.ts`. `sanitizeForTTS` moved from percl to `tts/helpers.ts`. Old `src/core/` and `src/percl/` directories removed.
-- **Phase 4 survey back-end (D1)**: Added D1 database (originally `jc-voxnos-surveys`, now `jc-voxnos`) with `survey_results` table. SurveyApp writes to D1 on completion (KV fallback if D1 unavailable). New data access module `src/services/survey-store.ts`. Admin endpoints: `GET /survey-results` (list with filters) and `GET /survey-results/:id` (detail). `DB?: D1Database` added to Env as optional binding.
+- **Phase 4 survey back-end (D1)**: Added D1 database (originally `voxnos-surveys`, now `voxnos`) with `survey_results` table. SurveyApp writes to D1 on completion (KV fallback if D1 unavailable). New data access module `src/services/survey-store.ts`. Admin endpoints: `GET /survey-results` (list with filters) and `GET /survey-results/:id` (detail). `DB?: D1Database` added to Env as optional binding.
 - **Phase 3 conversation engine + app-configurable re-prompts**: Introduced `src/engine/engine.ts` — platform-neutral conversation engine returning `TurnResult` discriminated union. Routes refactored to a FreeClimb adapter that pattern-matches on TurnResult. TTS helpers extracted to `src/tts/helpers.ts` and `src/tts/streaming.ts`. Added `retryPhrases` to `VoxnosApp` interface — each app declares its own no-input retry phrases.
 - **Phase 2 app configuration model**: Introduced `BaseApp` → `ConversationalApp` → `SurveyApp` class hierarchy. Ava refactored to ~30-line config declaration. Added Rita (neutral assistant) and Coco (3-question CX survey).
 - **Phase 1 shared services extraction**: Extracted Claude API client, conversation history management, and speech utilities into shared modules.
@@ -331,21 +331,21 @@ ELEVENLABS_API_KEY    # required when TTS_MODE=11labs
 ```
 **Vars (wrangler.toml):** `TTS_MODE = "google"`
 **KV:** `RATE_LIMIT_KV` (id: `58a6ac9954ea44d2972ba2cb9e1e077e`)
-**D1:** `DB` → `jc-voxnos` (id: `0998cfff-5efd-4b08-9186-4a3d4f528e98`) — optional, KV fallback if absent
-**Service Binding:** `COGNOS` → `jc-cognos` Worker
+**D1:** `DB` → `voxnos` (id: `0998cfff-5efd-4b08-9186-4a3d4f528e98`) — optional, KV fallback if absent
+**Service Binding:** `COGNOS` → `cognos` Worker
 
 ## Ava Platform Context
 
-Voice node of the Ava platform. Upstream: `jc-cognos` via `POST /brief`. Telephony: FreeClimb. Global constraints: Cloudflare free tier, KV ~30 writes/5-turn call. Full topology: `../platform/mesh/AVA-MAP.md`.
+Voice node of the Ava platform. Upstream: `cognos` via `POST /brief`. Telephony: FreeClimb. Global constraints: Cloudflare free tier, KV ~30 writes/5-turn call. Full topology: `../platform/mesh/AVA-MAP.md`.
 
 ## Debugging & Logs
 
 **"Check recent logs"** → run `./scripts/logs.sh` (most recent call timeline) or `./scripts/logs.sh <callId>`.
 - `./scripts/logs.sh --raw` → raw FreeClimb JSON (pipe to `jq`)
 - `./scripts/logs.sh --tail` → live Cloudflare Worker `console.log` output via `wrangler tail` (real-time only, ctrl-c to stop)
-- Admin API key is read from `.dev.vars`, base URL is `https://jc-voxnos.cloudflare-5cf.workers.dev`
+- Admin API key is read from `.dev.vars`, base URL is `https://voxnos.cloudflare-5cf.workers.dev`
 - **FreeClimb logs** (default mode, `GET /logs`): stored by FreeClimb, available after the fact — shows request/response bodies for every webhook exchange. This is the primary debugging tool.
-- **Cloudflare Worker logs** (`console.log`): only available live via `--tail` or historically via the Cloudflare dashboard (Workers & Pages → jc-voxnos → Logs). Structured JSON events: `call_incoming`, `conversation_turn`, `pre_filler`, `continue_poll`, `no_input`, `claude_stream_complete`, `tool_execute`, `call_end`
+- **Cloudflare Worker logs** (`console.log`): only available live via `--tail` or historically via the Cloudflare dashboard (Workers & Pages → voxnos → Logs). Structured JSON events: `call_incoming`, `conversation_turn`, `pre_filler`, `continue_poll`, `no_input`, `claude_stream_complete`, `tool_execute`, `call_end`
 - `rcrdTerminationSilenceTimeMs` max is 3000 (FreeClimb SDK ceiling)
 
 ## Deployment
