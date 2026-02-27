@@ -34,6 +34,7 @@ import {
   handleReloadApps,
 } from './admin/routes.js';
 import { loadAllActiveApps, loadPhoneRoutes } from './services/app-store.js';
+import { reloadAllowedCallers, isCallerAllowed } from './services/caller-allowlist.js';
 import { callElevenLabs, callGoogleTTS, computeTtsSignature } from './tts/index.js';
 
 // Deferred setup — runs once per isolate on first request so env is available.
@@ -60,6 +61,7 @@ async function setup(env: Env): Promise<void> {
       for (const route of routes) {
         registry.setPhoneRoute(route.phone_number, route.app_id);
       }
+      await reloadAllowedCallers(env.DB);
       if (defs.length) {
         console.log(JSON.stringify({ event: 'apps_loaded', count: defs.length, ids: defs.map(d => d.id) }));
       }
@@ -99,6 +101,14 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
       const ip = getIPFromRequest(request);
       const rateLimit = await checkRateLimit(env.RATE_LIMIT_KV, `call:${ip}`, RATE_LIMITS.CALL_START);
       if (!rateLimit.allowed) return new Response('Too many call attempts', { status: 429 });
+
+      // Caller allowlist check — peek at the body to get 'from', then pass a clone to the handler
+      const bodyClone = await request.clone().json() as { from?: string; callId?: string };
+      if (bodyClone.from && !isCallerAllowed(bodyClone.from)) {
+        console.log(JSON.stringify({ event: 'call_blocked', from: bodyClone.from, callId: bodyClone.callId, timestamp: new Date().toISOString() }));
+        return Response.json([{ Reject: {} }]);
+      }
+
       return handleIncomingCall(request, env, ctx);
     }
 

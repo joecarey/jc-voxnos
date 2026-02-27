@@ -6,9 +6,10 @@ import { z } from "zod";
 import type { Env } from "./engine/types.js";
 import { freeclimbAuth } from "./telephony/freeclimb-admin.js";
 import { registry } from "./engine/registry.js";
-import { listAppDefinitions, loadPhoneRoutes, savePhoneRoute } from "./services/app-store.js";
+import { listAppDefinitions, loadPhoneRoutes, savePhoneRoute, listAllowedCallers, addAllowedCaller, removeAllowedCaller } from "./services/app-store.js";
 import { listCallRecords, getCallRecord, getCallTurns } from "./services/cdr-store.js";
 import { listSurveyResults } from "./services/survey-store.js";
+import { reloadAllowedCallers } from "./services/caller-allowlist.js";
 
 /** Create and configure a fresh MCP server (one per request) */
 export function createServer(env: Env): McpServer {
@@ -428,6 +429,75 @@ export function createServer(env: Env): McpServer {
       });
       return {
         content: [{ type: "text" as const, text: `${results.length} survey result(s):\n\n${lines.join("\n\n")}` }],
+      };
+    }
+  );
+
+  // --- allowed_callers ---
+  server.tool(
+    "allowed_callers",
+    "List all phone numbers on the caller allowlist. When the allowlist is empty, all callers are allowed through. When non-empty, only listed numbers can reach the voice apps.",
+    {},
+    async () => {
+      if (!env.DB) {
+        return { content: [{ type: "text" as const, text: "D1 database not configured" }], isError: true };
+      }
+      const callers = await listAllowedCallers(env.DB);
+      if (!callers.length) {
+        return { content: [{ type: "text" as const, text: "Allowlist is empty — all callers are permitted." }] };
+      }
+      const lines = callers.map((c, i) => {
+        const label = c.label ? ` — ${c.label}` : "";
+        return `${i + 1}. **${c.phone_number}**${label}`;
+      });
+      return {
+        content: [{ type: "text" as const, text: `${callers.length} allowed caller(s):\n\n${lines.join("\n")}` }],
+      };
+    }
+  );
+
+  // --- allow_caller ---
+  server.tool(
+    "allow_caller",
+    "Add a phone number to the caller allowlist. Once the allowlist has any entries, only listed numbers can reach the voice apps.",
+    {
+      phone_number: z.string().describe("The phone number in E.164 format (e.g. '+14075551234')"),
+      label: z.string().optional().describe("Optional label for this caller (e.g. 'Joe', 'Mom')"),
+    },
+    async ({ phone_number, label }) => {
+      if (!env.DB) {
+        return { content: [{ type: "text" as const, text: "D1 database not configured" }], isError: true };
+      }
+      const ok = await addAllowedCaller(env.DB, phone_number, label);
+      if (!ok) {
+        return { content: [{ type: "text" as const, text: "Failed to add caller" }], isError: true };
+      }
+      const count = await reloadAllowedCallers(env.DB);
+      return {
+        content: [{ type: "text" as const, text: `Added **${phone_number}**${label ? ` (${label})` : ""} to allowlist. ${count} caller(s) now allowed.` }],
+      };
+    }
+  );
+
+  // --- block_caller ---
+  server.tool(
+    "block_caller",
+    "Remove a phone number from the caller allowlist. If this empties the list, all callers will be allowed through again.",
+    {
+      phone_number: z.string().describe("The phone number to remove in E.164 format"),
+    },
+    async ({ phone_number }) => {
+      if (!env.DB) {
+        return { content: [{ type: "text" as const, text: "D1 database not configured" }], isError: true };
+      }
+      const removed = await removeAllowedCaller(env.DB, phone_number);
+      if (!removed) {
+        return { content: [{ type: "text" as const, text: `${phone_number} was not on the allowlist.` }] };
+      }
+      const count = await reloadAllowedCallers(env.DB);
+      const note = count === 0 ? " Allowlist is now empty — all callers are permitted." : ` ${count} caller(s) remaining.`;
+      return {
+        content: [{ type: "text" as const, text: `Removed **${phone_number}** from allowlist.${note}` }],
       };
     }
   );

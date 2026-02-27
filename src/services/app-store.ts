@@ -114,6 +114,53 @@ export async function deletePhoneRoute(db: D1Database, phoneNumber: string): Pro
   return (meta.changes ?? 0) > 0;
 }
 
+// --- Allowed callers ---
+
+export interface AllowedCallerRow {
+  phone_number: string;
+  label: string | null;
+  created_at: string;
+}
+
+/** Load all allowed callers into a Set for fast lookup. */
+export async function loadAllowedCallers(db: D1Database): Promise<Set<string>> {
+  const { results } = await db.prepare('SELECT phone_number FROM allowed_callers').all();
+  return new Set((results as Record<string, unknown>[]).map(r => r.phone_number as string));
+}
+
+/** List all allowed callers with labels. */
+export async function listAllowedCallers(db: D1Database): Promise<AllowedCallerRow[]> {
+  const { results } = await db.prepare('SELECT * FROM allowed_callers ORDER BY created_at').all();
+  return (results as Record<string, unknown>[]).map(r => ({
+    phone_number: r.phone_number as string,
+    label: (r.label as string) ?? null,
+    created_at: r.created_at as string,
+  }));
+}
+
+/** Add a caller to the allowlist. */
+export async function addAllowedCaller(db: D1Database, phoneNumber: string, label?: string): Promise<boolean> {
+  try {
+    await db
+      .prepare('INSERT OR REPLACE INTO allowed_callers (phone_number, label) VALUES (?, ?)')
+      .bind(phoneNumber, label ?? null)
+      .run();
+    return true;
+  } catch (err) {
+    console.error('D1 addAllowedCaller failed:', err);
+    return false;
+  }
+}
+
+/** Remove a caller from the allowlist. */
+export async function removeAllowedCaller(db: D1Database, phoneNumber: string): Promise<boolean> {
+  const { meta } = await db
+    .prepare('DELETE FROM allowed_callers WHERE phone_number = ?')
+    .bind(phoneNumber)
+    .run();
+  return (meta.changes ?? 0) > 0;
+}
+
 // --- Row parsers ---
 
 function parseAppRow(row: Record<string, unknown>): AppDefinitionRow {
