@@ -4,7 +4,7 @@
 import { registry } from '../engine/registry.js';
 import type { Env } from '../engine/types.js';
 
-function freeclimbAuth(env: Env): { auth: string; apiBase: string } {
+export function freeclimbAuth(env: Env): { auth: string; apiBase: string } {
   return {
     auth: btoa(`${env.FREECLIMB_ACCOUNT_ID}:${env.FREECLIMB_API_KEY}`),
     apiBase: 'https://www.freeclimb.com/apiserver',

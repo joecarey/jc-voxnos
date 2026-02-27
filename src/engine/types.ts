@@ -15,6 +15,10 @@ export interface Env {
   COGNOS_PUBLIC_KEY: string;
   COGNOS: Fetcher;  // Service binding to cognos Worker
   DB?: D1Database;  // D1 database for persistent survey results (optional — KV fallback if absent)
+  OAUTH_KV: KVNamespace;  // OAuth token storage (shared with cognos/memnos)
+  AUTH_PASSWORD: string;   // OAuth authorize password
+  MCP_API_KEY: string;     // Bearer token for Claude Code CLI
+  OAUTH_PROVIDER: any;     // Injected by OAuthProvider
 }
 
 export interface AppContext {

@@ -20,5 +20,11 @@
     "@types/node": "^22.10.5",
     "typescript": "^5.7.2",
     "wrangler": "^4.67.0"
+  },
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "^0.2.4",
+    "@modelcontextprotocol/sdk": "^1.26.0",
+    "agents": "^0.5.1",
+    "zod": "^3.25.76"
   }
 }

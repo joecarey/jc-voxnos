@@ -1,6 +1,10 @@
 // Voxnos - Platform for building speech-enabled voice applications
 // Entry point: env validation, isolate setup, HTTP routing table.
 
+import { OAuthProvider } from '@cloudflare/workers-oauth-provider';
+import { createMcpHandler } from 'agents/mcp';
+import { createServer } from './mcp-server.js';
+import authHandler from './auth-handler.js';
 import { registry } from './engine/registry.js';
 import { EchoApp } from './apps/echo.js';
 import { AvaAssistant } from './apps/ava.js';
@@ -72,8 +76,8 @@ async function setup(env: Env): Promise<void> {
   setupDone = true;
 }
 
-export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+/** Exported for use by auth-handler.ts as the default handler fallback. */
+export async function handleFetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const envValidation = validateEnv(env);
     if (!envValidation.valid) {
       console.error('Environment validation failed:', envValidation);
@@ -371,5 +375,31 @@ export default {
     }
 
     return new Response('Not Found', { status: 404 });
+}
+
+const oauthProvider = new OAuthProvider({
+  apiRoute: '/mcp',
+  apiHandler: {
+    async fetch(request, env, ctx) {
+      const server = createServer(env as Env);
+      const handler = createMcpHandler(server);
+      return handler(request, env, ctx);
+    },
+  },
+  defaultHandler: authHandler as ExportedHandler,
+  authorizeEndpoint: '/authorize',
+  tokenEndpoint: '/token',
+  clientRegistrationEndpoint: '/register',
+  async resolveExternalToken({ token, env }) {
+    if (token === (env as Env).MCP_API_KEY) {
+      return { props: { user: 'claude-code', role: 'owner' } };
+    }
+    return null;
+  },
+});
+
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    return oauthProvider.fetch(request, env, ctx);
   },
 };

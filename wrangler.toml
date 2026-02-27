@@ -10,6 +10,10 @@ id = "58a6ac9954ea44d2972ba2cb9e1e077e"
 [vars]
 TTS_MODE = "google"
 
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "b347675bf9e34815b9c823a917eace29"
+
 [[d1_databases]]
 binding = "DB"
 database_name = "voxnos"
