@@ -114,36 +114,48 @@ export async function deletePhoneRoute(db: D1Database, phoneNumber: string): Pro
   return (meta.changes ?? 0) > 0;
 }
 
-// --- Allowed callers ---
+// --- Allowed callers (per inbound number) ---
 
 export interface AllowedCallerRow {
-  phone_number: string;
+  inbound_number: string;
+  caller_number: string;
   label: string | null;
   created_at: string;
 }
 
-/** Load all allowed callers into a Set for fast lookup. */
-export async function loadAllowedCallers(db: D1Database): Promise<Set<string>> {
-  const { results } = await db.prepare('SELECT phone_number FROM allowed_callers').all();
-  return new Set((results as Record<string, unknown>[]).map(r => r.phone_number as string));
+/** Load all allowed callers into a Map keyed by inbound number for fast lookup. */
+export async function loadAllowedCallers(db: D1Database): Promise<Map<string, Set<string>>> {
+  const { results } = await db.prepare('SELECT inbound_number, caller_number FROM allowed_callers').all();
+  const map = new Map<string, Set<string>>();
+  for (const r of results as Record<string, unknown>[]) {
+    const inbound = r.inbound_number as string;
+    const caller = r.caller_number as string;
+    if (!map.has(inbound)) map.set(inbound, new Set());
+    map.get(inbound)!.add(caller);
+  }
+  return map;
 }
 
-/** List all allowed callers with labels. */
-export async function listAllowedCallers(db: D1Database): Promise<AllowedCallerRow[]> {
-  const { results } = await db.prepare('SELECT * FROM allowed_callers ORDER BY created_at').all();
+/** List all allowed callers, optionally filtered by inbound number. */
+export async function listAllowedCallers(db: D1Database, inboundNumber?: string): Promise<AllowedCallerRow[]> {
+  const query = inboundNumber
+    ? db.prepare('SELECT * FROM allowed_callers WHERE inbound_number = ? ORDER BY created_at').bind(inboundNumber)
+    : db.prepare('SELECT * FROM allowed_callers ORDER BY inbound_number, created_at');
+  const { results } = await query.all();
   return (results as Record<string, unknown>[]).map(r => ({
-    phone_number: r.phone_number as string,
+    inbound_number: r.inbound_number as string,
+    caller_number: r.caller_number as string,
     label: (r.label as string) ?? null,
     created_at: r.created_at as string,
   }));
 }
 
-/** Add a caller to the allowlist. */
-export async function addAllowedCaller(db: D1Database, phoneNumber: string, label?: string): Promise<boolean> {
+/** Add a caller to the allowlist for a specific inbound number. */
+export async function addAllowedCaller(db: D1Database, inboundNumber: string, callerNumber: string, label?: string): Promise<boolean> {
   try {
     await db
-      .prepare('INSERT OR REPLACE INTO allowed_callers (phone_number, label) VALUES (?, ?)')
-      .bind(phoneNumber, label ?? null)
+      .prepare('INSERT OR REPLACE INTO allowed_callers (inbound_number, caller_number, label) VALUES (?, ?, ?)')
+      .bind(inboundNumber, callerNumber, label ?? null)
       .run();
     return true;
   } catch (err) {
@@ -152,11 +164,11 @@ export async function addAllowedCaller(db: D1Database, phoneNumber: string, labe
   }
 }
 
-/** Remove a caller from the allowlist. */
-export async function removeAllowedCaller(db: D1Database, phoneNumber: string): Promise<boolean> {
+/** Remove a caller from the allowlist for a specific inbound number. */
+export async function removeAllowedCaller(db: D1Database, inboundNumber: string, callerNumber: string): Promise<boolean> {
   const { meta } = await db
-    .prepare('DELETE FROM allowed_callers WHERE phone_number = ?')
-    .bind(phoneNumber)
+    .prepare('DELETE FROM allowed_callers WHERE inbound_number = ? AND caller_number = ?')
+    .bind(inboundNumber, callerNumber)
     .run();
   return (meta.changes ?? 0) > 0;
 }

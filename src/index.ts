@@ -102,10 +102,10 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
       const rateLimit = await checkRateLimit(env.RATE_LIMIT_KV, `call:${ip}`, RATE_LIMITS.CALL_START);
       if (!rateLimit.allowed) return new Response('Too many call attempts', { status: 429 });
 
-      // Caller allowlist check — peek at the body to get 'from', then pass a clone to the handler
-      const bodyClone = await request.clone().json() as { from?: string; callId?: string };
-      if (bodyClone.from && !isCallerAllowed(bodyClone.from)) {
-        console.log(JSON.stringify({ event: 'call_blocked', from: bodyClone.from, callId: bodyClone.callId, timestamp: new Date().toISOString() }));
+      // Per-number caller allowlist — peek at body for from/to, reject if not allowed
+      const bodyClone = await request.clone().json() as { from?: string; to?: string; callId?: string };
+      if (bodyClone.from && bodyClone.to && !isCallerAllowed(bodyClone.to, bodyClone.from)) {
+        console.log(JSON.stringify({ event: 'call_blocked', from: bodyClone.from, to: bodyClone.to, callId: bodyClone.callId, timestamp: new Date().toISOString() }));
         return Response.json([{ Reject: {} }]);
       }
 
