@@ -189,7 +189,7 @@ export function createServer(env: Env): McpServer {
   // --- buy_number ---
   server.tool(
     "buy_number",
-    "Purchase a phone number from FreeClimb and assign it to the Voxnos Platform application. WARNING: This incurs real telephony costs on the FreeClimb account.",
+    "Purchase a phone number from FreeClimb and assign it to the Voxnos Platform application. WARNING: This incurs real telephony costs. Always confirm the number and intent with the user before executing.",
     {
       phone_number: z.string().describe("The phone number to purchase in E.164 format (e.g. '+14075551234')"),
     },
