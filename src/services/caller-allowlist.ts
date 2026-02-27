@@ -3,7 +3,7 @@
 // If a number's allowlist is disabled (or has no entries), all callers pass through.
 // Extracted into its own module to avoid circular imports between index.ts and mcp-server.ts.
 
-import { loadAllowedCallers, loadAllowlistEnabled } from './app-store.js';
+import { loadAllowedCallers, loadAllowlistEnabled, normalizeE164 } from './app-store.js';
 
 // Map<inbound_number, Set<caller_number>>
 let allowedCallers = new Map<string, Set<string>>();
@@ -24,10 +24,13 @@ export async function reloadAllowedCallers(db: D1Database): Promise<number> {
 }
 
 /** Check if a caller is allowed to reach a specific inbound number.
- *  Returns true if allowlist is not enabled for that number, or if the caller is listed. */
+ *  Returns true if allowlist is not enabled for that number, or if the caller is listed.
+ *  Both numbers are normalized to E.164 before comparison. */
 export function isCallerAllowed(inboundNumber: string, callerNumber: string): boolean {
-  if (!enabledNumbers.has(inboundNumber)) return true; // enforcement off
-  const set = allowedCallers.get(inboundNumber);
+  const inbound = normalizeE164(inboundNumber);
+  const caller = normalizeE164(callerNumber);
+  if (!enabledNumbers.has(inbound)) return true; // enforcement off
+  const set = allowedCallers.get(inbound);
   if (!set || set.size === 0) return true; // enabled but no entries = open
-  return set.has(callerNumber);
+  return set.has(caller);
 }

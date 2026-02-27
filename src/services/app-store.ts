@@ -114,6 +114,18 @@ export async function deletePhoneRoute(db: D1Database, phoneNumber: string): Pro
   return (meta.changes ?? 0) > 0;
 }
 
+// --- Phone number normalization ---
+
+/** Normalize a phone number to E.164 format (+1XXXXXXXXXX for US numbers).
+ *  Handles: 8472742489, 18472742489, +18472742489, (847) 274-2489, etc. */
+export function normalizeE164(input: string): string {
+  const digits = input.replace(/\D/g, '');
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith('1')) return `+${digits}`;
+  if (input.startsWith('+')) return input;
+  return `+${digits}`;
+}
+
 // --- Allowed callers (per inbound number) ---
 
 export interface AllowedCallerRow {
@@ -139,7 +151,7 @@ export async function loadAllowedCallers(db: D1Database): Promise<Map<string, Se
 /** List all allowed callers, optionally filtered by inbound number. */
 export async function listAllowedCallers(db: D1Database, inboundNumber?: string): Promise<AllowedCallerRow[]> {
   const query = inboundNumber
-    ? db.prepare('SELECT * FROM allowed_callers WHERE inbound_number = ? ORDER BY created_at').bind(inboundNumber)
+    ? db.prepare('SELECT * FROM allowed_callers WHERE inbound_number = ? ORDER BY created_at').bind(normalizeE164(inboundNumber))
     : db.prepare('SELECT * FROM allowed_callers ORDER BY inbound_number, created_at');
   const { results } = await query.all();
   return (results as Record<string, unknown>[]).map(r => ({
@@ -150,12 +162,12 @@ export async function listAllowedCallers(db: D1Database, inboundNumber?: string)
   }));
 }
 
-/** Add a caller to the allowlist for a specific inbound number. */
+/** Add a caller to the allowlist for a specific inbound number. Numbers are normalized to E.164. */
 export async function addAllowedCaller(db: D1Database, inboundNumber: string, callerNumber: string, label?: string): Promise<boolean> {
   try {
     await db
       .prepare('INSERT OR REPLACE INTO allowed_callers (inbound_number, caller_number, label) VALUES (?, ?, ?)')
-      .bind(inboundNumber, callerNumber, label ?? null)
+      .bind(normalizeE164(inboundNumber), normalizeE164(callerNumber), label ?? null)
       .run();
     return true;
   } catch (err) {
@@ -164,11 +176,11 @@ export async function addAllowedCaller(db: D1Database, inboundNumber: string, ca
   }
 }
 
-/** Remove a caller from the allowlist for a specific inbound number. */
+/** Remove a caller from the allowlist for a specific inbound number. Numbers are normalized to E.164. */
 export async function removeAllowedCaller(db: D1Database, inboundNumber: string, callerNumber: string): Promise<boolean> {
   const { meta } = await db
     .prepare('DELETE FROM allowed_callers WHERE inbound_number = ? AND caller_number = ?')
-    .bind(inboundNumber, callerNumber)
+    .bind(normalizeE164(inboundNumber), normalizeE164(callerNumber))
     .run();
   return (meta.changes ?? 0) > 0;
 }
@@ -181,12 +193,12 @@ export async function loadAllowlistEnabled(db: D1Database): Promise<Set<string>>
   return new Set((results as Record<string, unknown>[]).map(r => r.inbound_number as string));
 }
 
-/** Enable allowlist enforcement for an inbound number. */
+/** Enable allowlist enforcement for an inbound number. Number is normalized to E.164. */
 export async function enableAllowlist(db: D1Database, inboundNumber: string): Promise<boolean> {
   try {
     await db
       .prepare('INSERT OR IGNORE INTO allowlist_enabled (inbound_number) VALUES (?)')
-      .bind(inboundNumber)
+      .bind(normalizeE164(inboundNumber))
       .run();
     return true;
   } catch (err) {
@@ -195,11 +207,11 @@ export async function enableAllowlist(db: D1Database, inboundNumber: string): Pr
   }
 }
 
-/** Disable allowlist enforcement for an inbound number. */
+/** Disable allowlist enforcement for an inbound number. Number is normalized to E.164. */
 export async function disableAllowlist(db: D1Database, inboundNumber: string): Promise<boolean> {
   const { meta } = await db
     .prepare('DELETE FROM allowlist_enabled WHERE inbound_number = ?')
-    .bind(inboundNumber)
+    .bind(normalizeE164(inboundNumber))
     .run();
   return (meta.changes ?? 0) > 0;
 }
