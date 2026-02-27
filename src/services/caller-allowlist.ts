@@ -1,25 +1,33 @@
 // In-memory caller allowlist — loaded from D1 at startup, refreshable via MCP.
-// Per-inbound-number: each of your phone numbers has its own set of allowed callers.
-// If an inbound number has no entries, all callers are allowed to that number.
+// Per-inbound-number with an explicit enable/disable toggle.
+// If a number's allowlist is disabled (or has no entries), all callers pass through.
 // Extracted into its own module to avoid circular imports between index.ts and mcp-server.ts.
 
-import { loadAllowedCallers } from './app-store.js';
+import { loadAllowedCallers, loadAllowlistEnabled } from './app-store.js';
 
 // Map<inbound_number, Set<caller_number>>
 let allowedCallers = new Map<string, Set<string>>();
+// Set of inbound numbers with enforcement enabled
+let enabledNumbers = new Set<string>();
 
-/** Reload the allowed callers map from D1. Returns total entry count. */
+/** Reload both the allowed callers map and enabled set from D1. Returns total entry count. */
 export async function reloadAllowedCallers(db: D1Database): Promise<number> {
-  allowedCallers = await loadAllowedCallers(db);
+  const [callers, enabled] = await Promise.all([
+    loadAllowedCallers(db),
+    loadAllowlistEnabled(db),
+  ]);
+  allowedCallers = callers;
+  enabledNumbers = enabled;
   let total = 0;
   for (const set of allowedCallers.values()) total += set.size;
   return total;
 }
 
 /** Check if a caller is allowed to reach a specific inbound number.
- *  Returns true if no allowlist exists for that inbound number (open). */
+ *  Returns true if allowlist is not enabled for that number, or if the caller is listed. */
 export function isCallerAllowed(inboundNumber: string, callerNumber: string): boolean {
+  if (!enabledNumbers.has(inboundNumber)) return true; // enforcement off
   const set = allowedCallers.get(inboundNumber);
-  if (!set || set.size === 0) return true; // no allowlist for this number = open
+  if (!set || set.size === 0) return true; // enabled but no entries = open
   return set.has(callerNumber);
 }

@@ -173,6 +173,37 @@ export async function removeAllowedCaller(db: D1Database, inboundNumber: string,
   return (meta.changes ?? 0) > 0;
 }
 
+// --- Allowlist toggle (per inbound number) ---
+
+/** Load the set of inbound numbers with allowlist enforcement enabled. */
+export async function loadAllowlistEnabled(db: D1Database): Promise<Set<string>> {
+  const { results } = await db.prepare('SELECT inbound_number FROM allowlist_enabled').all();
+  return new Set((results as Record<string, unknown>[]).map(r => r.inbound_number as string));
+}
+
+/** Enable allowlist enforcement for an inbound number. */
+export async function enableAllowlist(db: D1Database, inboundNumber: string): Promise<boolean> {
+  try {
+    await db
+      .prepare('INSERT OR IGNORE INTO allowlist_enabled (inbound_number) VALUES (?)')
+      .bind(inboundNumber)
+      .run();
+    return true;
+  } catch (err) {
+    console.error('D1 enableAllowlist failed:', err);
+    return false;
+  }
+}
+
+/** Disable allowlist enforcement for an inbound number. */
+export async function disableAllowlist(db: D1Database, inboundNumber: string): Promise<boolean> {
+  const { meta } = await db
+    .prepare('DELETE FROM allowlist_enabled WHERE inbound_number = ?')
+    .bind(inboundNumber)
+    .run();
+  return (meta.changes ?? 0) > 0;
+}
+
 // --- Row parsers ---
 
 function parseAppRow(row: Record<string, unknown>): AppDefinitionRow {
